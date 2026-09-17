@@ -1,0 +1,30 @@
+<!-- AGENTS.md authoring rule (keep this comment in the template; delete it in a real plugin):
+     Document ONLY what an agent cannot derive by reading the code and the file tree.
+     - DO capture: cross-file / cross-repo contracts, non-obvious conventions, gotchas and
+       their "why", external requirements (secrets, services), and deliberate design choices.
+     - DON'T restate: the directory layout, what a workflow YAML does step-by-step, or how a
+       build script works line-by-line — an agent reads those directly. If a sentence only
+       narrates a file the reader already has in front of them, cut it.
+     A lean AGENTS.md the agent trusts beats an exhaustive one it has to re-verify. -->
+
+# agent-harness
+
+PyInstaller-frozen Python MCP server, shipped as a self-contained binary (`bin/harness` on Linux, `bin/harness.exe` on Windows). End users need no Python toolchain.
+
+## Contracts an agent won't infer from the tree
+
+- **Release is orphan-branch + marketplace dispatch.** `release.yml` (manual: Actions → release → `version=X.Y.Z`) stamps the version, matrix-builds per OS, then force-pushes an orphan `release` branch holding only install-ready files and POSTs a dispatch to `Seretos/agent-marketplace`. `main` and `release` share no history — never merge between them. Clients install at the tag `agent-harness--vX.Y.Z`.
+- **Version is pipeline-owned.** The `version` in `pyproject.toml` and both manifests is a placeholder; the workflow input is the source of truth and the stamp never lands on `main`. Don't hand-bump it.
+- **Two host manifests, no `.mcp.json`.** `.claude-plugin/plugin.json` resolves its `command` via `${CLAUDE_PLUGIN_ROOT}`; `.codex-plugin/plugin.json` via `${PLUGIN_ROOT}`. Both carry an inline `mcpServers` block because neither placeholder expands in the other host. Keep the two in sync.
+- **Required secret:** `MARKETPLACE_DISPATCH_TOKEN` — fine-grained PAT, `Contents: RW` + `Pull requests: RW` on `Seretos/agent-marketplace` only.
+- **`assets/icon.png` is a release artifact, not just a repo file.** The dispatch payload sends a `raw.githubusercontent.com/${repo}/${TAG}/assets/icon.png` URL to the marketplace, so the file must live on the orphan `release` branch at the tagged commit — `release.yml` copies `stamped/assets/` into the staging tree for exactly that reason. Ship `assets/icon.png` from day one or the marketplace listing has no image.
+- **`description.md` is a release artifact, not just a repo file.** The dispatch payload sends a `raw.githubusercontent.com/${repo}/${TAG}/description.md` URL in the `description_url` field, so the file must live on the orphan `release` branch at the tagged commit — `release.yml` copies it into the staging tree alongside `assets/`. Fill in its Key Features before cutting v0.0.1.
+
+## OS targets
+
+Default is multi-OS (`[windows, linux]`) and the shipped wiring already does it — you do nothing. Flip to **Windows-only** only for a genuinely Win32-bound plugin (COM / `pyvda` / `pywin32` / `comtypes`). To flip: drop `ubuntu-22.04` from the `build` matrix in `release.yml` and from `matrix.os` in `test.yml`; drop the Linux-binary assertion, `chmod +x`, and `git add` for `bin/harness` in `release.yml`'s assembly + push steps; and append `.exe` to `command` in both manifests.
+
+## Gotchas (the "why" behind the code)
+
+- **`build.ps1` runs under Windows PowerShell 5.1, PS7, and Linux `pwsh`.** It derives `$IsWindows` from `$env:OS` (5.1 lacks the auto variable) and sets no global `$ErrorActionPreference='Stop'` (PyInstaller floods stderr, which 5.1 wraps as ErrorRecords and would trip a global Stop). The smoke step gates the build on a real MCP `initialize` handshake.
+- **Native bindings need `collect_all(...)` in `harness.spec`** — PyInstaller misses their lazily-generated submodules otherwise. Needing them usually also means you want `OS_TARGETS=[windows]`.
