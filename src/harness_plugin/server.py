@@ -1,12 +1,212 @@
+"""MCP tool surface over lib_python_harness: one tool per public lib entry point."""
+from __future__ import annotations
+
+import functools
+import inspect
+import json
+import os
+from enum import Enum
+from functools import partial
+from pathlib import Path
+from typing import Any
+
+import anyio.to_thread
+from lib_python_harness import (
+    FileRunStore,
+    Harness,
+    HarnessError,
+    HostContext,
+    Isolation,
+    RunSpec,
+    discover,
+    resolve,
+)
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
 mcp = FastMCP("harness")
 
+_HARNESS: Harness | None = None
+
+
+def _artifacts_root() -> Path:
+    override = os.environ.get("HARNESS_ARTIFACTS_DIR")
+    root = Path(override) if override else Path.home() / ".agent-harness" / "runs"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _claude_argv() -> list[str]:
+    raw = os.environ.get("HARNESS_CLAUDE_ARGV")
+    return [str(a) for a in json.loads(raw)] if raw else ["claude"]
+
+
+def _harness() -> Harness:
+    """Lazy singleton: poll/wait/stop depend on the in-process Popen map."""
+    global _HARNESS
+    if _HARNESS is None:
+        _HARNESS = Harness(store=FileRunStore(_artifacts_root()), claude_argv=_claude_argv())
+    return _HARNESS
+
+
+def _tool_errors(fn):
+    """Re-raise lib errors as ToolError carrying the exception class name."""
+    if inspect.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            try:
+                return await fn(*args, **kwargs)
+            except HarnessError as exc:
+                raise ToolError(f"{type(exc).__name__}: {exc}") from exc
+
+    else:
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except HarnessError as exc:
+                raise ToolError(f"{type(exc).__name__}: {exc}") from exc
+
+    return wrapper
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, Enum):
+        return value.name
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+def _run_to_dict(result: Any, **extra: Any) -> dict[str, Any]:
+    out = {
+        "run_id": result.run_id,
+        "session_id": result.session_id,
+        "state": _jsonable(result.state),
+        "text": result.text,
+        "is_error": result.is_error,
+        "subtype": result.subtype,
+        "structured_output": result.structured_output,
+        "usage": result.usage,
+        "cost": result.cost,
+        "transcript_path": _jsonable(result.transcript_path),
+        "duration_s": result.duration_s,
+    }
+    out.update(extra)
+    return out
+
 
 @mcp.tool()
-def ping() -> str:
-    """Health check tool. Replace with real tools as you build them out."""
-    return "pong"
+@_tool_errors
+def harness_list_agents(cwd: str | None = None) -> dict[str, Any]:
+    """List the subagent definitions (project, user and plugin scope) visible from `cwd`
+    (default: the server's working directory). The used cwd is echoed back."""
+    used = cwd or os.getcwd()
+    found = discover(HostContext(cwd=used))
+    return {
+        "cwd": used,
+        "agents": [
+            {
+                "qualified_name": name,
+                "name": d.name,
+                "description": d.description,
+                "source_scope": d.source_scope,
+                "path": str(d.path),
+                "model": d.model,
+            }
+            for name, d in found.items()
+        ],
+    }
+
+
+@mcp.tool()
+@_tool_errors
+def harness_start_agent(
+    agent: str,
+    cwd: str | None = None,
+    model: str | None = None,
+    permission_mode: str | None = None,
+    effort: str | None = None,
+) -> dict[str, Any]:
+    """Start a discovered subagent (by qualified_name) as a background run and return its
+    run_id immediately; use harness_poll_run or harness_wait_run for the result. `model`
+    overrides the definition's model; one of the two is required. `cwd` defaults to the
+    server's working directory and is echoed back."""
+    used = cwd or os.getcwd()
+    ctx = HostContext(cwd=used, model=model, permission_mode=permission_mode, effort=effort)
+    definitions = discover(ctx)
+    definition = definitions.get(agent)
+    if definition is None:
+        known = ", ".join(sorted(definitions)) or "(none)"
+        raise ToolError(f"unknown agent {agent!r}; known agents: {known}")
+    spec = resolve(definition, ctx)
+    if model:
+        spec.model = model
+    if spec.model is None:
+        raise ToolError(
+            f"no model for agent {agent!r}: pass `model` or set `model:` in its definition"
+        )
+    spec.cwd = used
+    spec.artifacts_dir = _artifacts_root()
+    return _run_to_dict(_harness().start(spec), cwd=used)
+
+
+@mcp.tool()
+@_tool_errors
+def harness_start_prompt(
+    prompt: str,
+    model: str,
+    effort: str | None = None,
+    system_prompt: str | None = None,
+    cwd: str | None = None,
+) -> dict[str, Any]:
+    """Start an ad-hoc prompt in a clean (no memory, no project config) run and return its
+    run_id immediately. With `cwd` unset the run gets a fresh empty temp directory; a given
+    `cwd` must exist, be empty and not sit inside a git repository."""
+    spec = RunSpec(
+        prompt=prompt,
+        isolation=Isolation.CLEAN,
+        model=model,
+        effort=effort,
+        system_prompt=system_prompt,
+        cwd=cwd,
+        artifacts_dir=_artifacts_root(),
+    )
+    return _run_to_dict(_harness().start(spec))
+
+
+@mcp.tool()
+@_tool_errors
+def harness_poll_run(run_id: str) -> dict[str, Any]:
+    """Return the current state (and result, once finished) of a run without blocking."""
+    return _run_to_dict(_harness().poll(run_id))
+
+
+@mcp.tool()
+@_tool_errors
+async def harness_wait_run(run_id: str, timeout_seconds: float = 300.0) -> dict[str, Any]:
+    """Block until the run finishes and return its result. WARNING: if `timeout_seconds`
+    (default 300) expires first, the deadline cancels the run (terminal state CANCELLED)
+    rather than just giving up waiting; use harness_poll_run to check without cancelling."""
+    result = await anyio.to_thread.run_sync(partial(_harness().wait, run_id, timeout_seconds))
+    return _run_to_dict(result)
+
+
+@mcp.tool()
+@_tool_errors
+def harness_stop_run(run_id: str) -> dict[str, Any]:
+    """Stop a RUNNING run (terminal state CANCELLED). Errors on an already finished run."""
+    return _run_to_dict(_harness().stop(run_id))
+
+
+@mcp.tool()
+@_tool_errors
+def harness_cleanup_run(run_id: str) -> dict[str, Any]:
+    """Forget a run's record. Artifacts on disk are kept; the run cannot be polled afterwards."""
+    _harness().cleanup(run_id)
+    return {"run_id": run_id, "cleaned": True}
 
 
 def main() -> None:

@@ -18,3 +18,5 @@ dist/
 # also covered, not just the Windows .exe.
 /bin/
 *.pyinstaller.tmp/
+.adev/
+.serena/

@@ -1,0 +1,61 @@
+"""Minimal stand-in for the `claude` CLI, driven through HARNESS_CLAUDE_ARGV.
+
+Answers `--version`; otherwise reads the prompt from stdin and emits the
+stream-json events `lib_python_harness` parses (a terminal `result` event
+carrying `result` and `session_id`). A prompt containing `SLEEP:<seconds>`
+keeps the process alive first, so one fixture yields both a fast run and a
+still-RUNNING run.
+"""
+import json
+import re
+import sys
+import time
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if "--version" in argv:
+        print("2.0.0 (Claude Code)")
+        return 0
+
+    session_id = "fake-session"
+    if "--session-id" in argv:
+        session_id = argv[argv.index("--session-id") + 1]
+
+    prompt = sys.stdin.read()
+    match = re.search(r"SLEEP:(\d+(?:\.\d+)?)", prompt)
+    print(json.dumps({"type": "system", "subtype": "init", "session_id": session_id}), flush=True)
+    if match:
+        deadline = time.monotonic() + float(match.group(1))
+        while time.monotonic() < deadline:
+            time.sleep(0.1)
+
+    print(
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "OK"}]},
+                "session_id": session_id,
+            }
+        ),
+        flush=True,
+    )
+    print(
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": "OK",
+                "session_id": session_id,
+                "total_cost_usd": 0.0,
+                "usage": {},
+            }
+        ),
+        flush=True,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

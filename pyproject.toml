@@ -9,7 +9,8 @@ description = "Provider-independent subagent system for coding agents - replaces
 requires-python = ">=3.11"
 authors = [{ name = "Arne von Appen" }]
 dependencies = [
-  "mcp>=1.2",
+  "mcp>=1.2,<2",
+  "lib-python-harness @ git+https://github.com/Seretos/lib-python-harness@v0.0.1",
 ]
 
 [project.optional-dependencies]
