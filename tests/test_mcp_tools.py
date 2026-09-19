@@ -70,7 +70,9 @@ def test_tools_list_exposes_harness_tools_and_no_ping(server_params):
     assert EXPECTED_TOOLS <= names
     assert "ping" not in names
     for t in tools:
-        assert (t.description or "").strip(), f"{t.name} has no description"
+        assert len((t.description or "").strip()) >= 20, f"{t.name} has no real description"
+    wait_desc = next(t for t in tools if t.name == "harness_wait_run").description.lower()
+    assert "cancel" in wait_desc, "wait description must warn that the deadline cancels the run"
 
 
 def test_list_agents_returns_project_agent(server_params, project_dir):
@@ -184,6 +186,7 @@ def test_stop_cancels_running_run_then_errors_on_finished_run(server_params, pro
     assert first[2]["state"] == "CANCELLED"
     assert second[0] is True
     assert "IllegalTransitionError" in second[1]
+    assert "illegal run state transition: CANCELLED -> CANCELLED" in second[1]
     assert polled[2]["state"] == "CANCELLED"
     assert alive[0] is False, alive[1]
 
@@ -216,3 +219,34 @@ def test_error_paths_return_structured_errors(server_params, project_dir, tmp_pa
     assert unknown_run[0] is True
     assert "HarnessError" in unknown_run[1]
     assert alive[0] is False, alive[1]
+
+
+def test_wait_run_does_not_block_other_tool_calls(server_params, project_dir):
+    """A wait in flight must not wedge the server: another call has to be answered
+    while the wait is still blocked (proves the thread offload)."""
+
+    async def scenario(session):
+        is_error, text, started = await _call(
+            session, "harness_start_prompt", prompt="SLEEP:30", model="sonnet"
+        )
+        assert not is_error, text
+        wait_done = anyio.Event()
+        box = {}
+
+        async def waiter():
+            box["wait"] = await _call(
+                session, "harness_wait_run", run_id=started["run_id"], timeout_seconds=4
+            )
+            wait_done.set()
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(waiter)
+            await anyio.sleep(0.5)
+            listed = await _call(session, "harness_list_agents", cwd=str(project_dir))
+            still_waiting = not wait_done.is_set()
+        return listed, still_waiting, box["wait"]
+
+    listed, still_waiting, waited = _run(scenario, server_params)
+    assert listed[0] is False, listed[1]
+    assert still_waiting, "list_agents only returned after the wait finished"
+    assert waited[2]["state"] == "CANCELLED"

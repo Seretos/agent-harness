@@ -33,6 +33,7 @@ extra_hidden = [
     "starlette",
 ]
 extra_hidden += collect_submodules("harness_plugin")
+extra_hidden += collect_submodules("lib_python_harness")
 
 a = Analysis(
     ["src/harness_plugin/__main__.py"],

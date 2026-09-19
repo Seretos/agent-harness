@@ -45,3 +45,26 @@ jobs:
       - name: Run pytest
         shell: bash
         run: python -m pytest
+
+  # Frozen-binary check: builds the PyInstaller binary and smoke-tests it with a
+  # real MCP initialize + tools/list (fails if lib_python_harness is not bundled).
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build and smoke-test the binary
+        shell: pwsh
+        run: pwsh -File scripts/build.ps1

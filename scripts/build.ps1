@@ -233,23 +233,25 @@ if ($IsWindows) {
 # PowerShell 5.1's Process StreamWriter prepends a UTF-8 BOM that MCP rejects.
 # Work around it by staging the request in a temp file and using
 # Start-Process -RedirectStandardInput, which pipes raw OS bytes.
-Write-Step "Smoke-testing the binary (MCP initialize)"
+Write-Step "Smoke-testing the binary (MCP initialize + tools/list)"
 $initMsg = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"build-smoke","version":"1"}}}'
+$initializedMsg = '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+$listMsg = '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
 $inFile = [System.IO.Path]::GetTempFileName()
 $outFile = [System.IO.Path]::GetTempFileName()
 $errFile = [System.IO.Path]::GetTempFileName()
-[System.IO.File]::WriteAllBytes($inFile, [System.Text.Encoding]::UTF8.GetBytes($initMsg + "`n"))
+[System.IO.File]::WriteAllBytes($inFile, [System.Text.Encoding]::UTF8.GetBytes($initMsg + "`n" + $initializedMsg + "`n" + $listMsg + "`n"))
 $proc = Start-Process -FilePath "bin/$ExeName" `
     -RedirectStandardInput $inFile `
     -RedirectStandardOutput $outFile `
     -RedirectStandardError $errFile `
     -NoNewWindow -PassThru
-if (-not $proc.WaitForExit(8000)) { $proc.Kill(); Start-Sleep -Milliseconds 200 }
+if (-not $proc.WaitForExit(15000)) { $proc.Kill(); Start-Sleep -Milliseconds 200 }
 $stdout = (Get-Content -Raw -ErrorAction SilentlyContinue $outFile)
 $stderrText = (Get-Content -Raw -ErrorAction SilentlyContinue $errFile)
 Remove-Item -ErrorAction SilentlyContinue $inFile, $outFile, $errFile
-if ($stdout -match '"result"' -and $stdout -match '"protocolVersion"') {
-    Write-Host "    handshake OK" -ForegroundColor Green
+if ($stdout -match '"result"' -and $stdout -match '"protocolVersion"' -and $stdout -match 'harness_list_agents') {
+    Write-Host "    handshake + tools/list OK" -ForegroundColor Green
 } else {
     Write-Host "    stdout: $stdout" -ForegroundColor Yellow
     Write-Host "    stderr: $stderrText" -ForegroundColor Yellow
