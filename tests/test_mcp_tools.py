@@ -2,7 +2,6 @@
 talking to the fake claude CLI from tests/fixtures/fake_claude.py."""
 import json
 import os
-import sys
 import time
 from contextlib import asynccontextmanager
 
@@ -21,12 +20,6 @@ EXPECTED_TOOLS = {
     "harness_stop_run",
     "harness_cleanup_run",
 }
-# lib-python-harness v0.0.1 cancels a run via os.WNOHANG/SIGKILL, which do not
-# exist on Windows: stop/deadline-cancel raise AttributeError there (upstream limit).
-posix_cancel = pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="lib-python-harness v0.0.1 cancel path uses os.WNOHANG (POSIX only)",
-)
 TERMINAL = {"COMPLETED", "FAILED", "CANCELLED"}
 
 
@@ -160,7 +153,6 @@ def test_wait_run_returns_completed_result(server_params, project_dir):
     assert final["session_id"]
 
 
-@posix_cancel
 def test_wait_run_deadline_cancels_and_server_stays_responsive(server_params, project_dir):
     async def scenario(session):
         is_error, text, started = await _call(
@@ -179,7 +171,6 @@ def test_wait_run_deadline_cancels_and_server_stays_responsive(server_params, pr
     assert after[0] is False, after[1]
 
 
-@posix_cancel
 def test_stop_cancels_running_run_then_errors_on_finished_run(server_params, project_dir):
     async def scenario(session):
         is_error, text, started = await _call(
@@ -233,7 +224,6 @@ def test_error_paths_return_structured_errors(server_params, project_dir, tmp_pa
     assert alive[0] is False, alive[1]
 
 
-@posix_cancel
 def test_wait_run_does_not_block_other_tool_calls(server_params, project_dir):
     """A wait in flight must not wedge the server: another call has to be answered
     while the wait is still blocked (proves the thread offload)."""
