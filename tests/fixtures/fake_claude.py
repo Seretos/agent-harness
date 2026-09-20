@@ -11,6 +11,8 @@ exits after the init event without any `result` event (a FAILED run).
 A prompt containing `TICK:<count>:<interval>` emits `count` assistant events
 `interval` seconds apart (flushed) before the terminal `result` event, so a
 still-RUNNING run makes visible progress.
+A prompt containing `ECHO:<word>` is answered with `<word>` instead of `OK`. The session
+id is taken from `--session-id <id>` or, for a resumed run, `--resume <id>`.
 """
 import json
 import os
@@ -31,8 +33,9 @@ def main() -> int:
             fh.write(json.dumps({"argv": argv, "cwd": os.getcwd()}) + "\n")
 
     session_id = "fake-session"
-    if "--session-id" in argv:
-        session_id = argv[argv.index("--session-id") + 1]
+    for flag in ("--session-id", "--resume"):
+        if flag in argv:
+            session_id = argv[argv.index(flag) + 1]
 
     prompt = sys.stdin.read()
     match = re.search(r"SLEEP:(\d+(?:\.\d+)?)", prompt)
@@ -60,6 +63,9 @@ def main() -> int:
             )
             time.sleep(float(tick.group(2)))
 
+    echo = re.search(r"ECHO:(\w+)", prompt)
+    answer = echo.group(1) if echo else "OK"
+
     if "NO_RESULT" in prompt:
         # Ends without a terminal `result` event: the run finishes FAILED.
         return 0
@@ -68,7 +74,7 @@ def main() -> int:
         json.dumps(
             {
                 "type": "assistant",
-                "message": {"role": "assistant", "content": [{"type": "text", "text": "OK"}]},
+                "message": {"role": "assistant", "content": [{"type": "text", "text": answer}]},
                 "session_id": session_id,
             }
         ),
@@ -80,7 +86,7 @@ def main() -> int:
                 "type": "result",
                 "subtype": "success",
                 "is_error": False,
-                "result": "OK",
+                "result": answer,
                 "session_id": session_id,
                 "total_cost_usd": 0.0,
                 "usage": {},

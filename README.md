@@ -56,6 +56,8 @@ harness wait-run --run-id <id> --timeout <seconds> [--interval <seconds>]
 
 `harness_list_runs` lists all recorded runs as compact rows (`run_id`, `state`, `model`, `cwd`, `created_at`, `label`; no text or usage) so a lost `run_id` can be found again; `harness_start_prompt`/`harness_start_agent` accept an optional `label`, and `harness_poll_run` reports `event_count`/`last_event_at` while a run is RUNNING.
 
+`harness_send_message(run_id, prompt)` sends a follow-up to a **finished** run: it resumes the origin's session (keeping its isolation) and returns a new RUNNING run with its own `run_id`; then use `harness_wait_run` or `harness_poll_run` on it.
+
 It prints one `harness_poll_run`-shaped JSON object plus `waited_s` on stdout and never cancels the run. `--timeout` is required; `--interval` defaults to 2 (minimum 0.2).
 
 | exit code | meaning |

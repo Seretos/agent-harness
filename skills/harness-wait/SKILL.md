@@ -25,6 +25,7 @@ instead: its timeout only stops the waiting, never the run.
 4. You are notified when the command exits. Read its stdout: exactly one JSON object shaped
    like a `harness_poll_run` result, plus `waited_s` (seconds actually waited).
 5. If you lost the `run_id` (e.g. after context compaction), find the run with `harness_list_runs` first. Afterwards call `harness_cleanup_run` to forget the run record.
+6. To continue a finished run's conversation, call `harness_send_message(run_id, prompt)`: it returns a **new** `run_id` (RUNNING); wait on that one with the steps above.
 
 ## Exit codes
 

@@ -23,6 +23,7 @@ EXPECTED_TOOLS = {
     "harness_wait_run",
     "harness_stop_run",
     "harness_cleanup_run",
+    "harness_send_message",
 }
 TERMINAL = {"COMPLETED", "FAILED", "CANCELLED"}
 
@@ -95,6 +96,19 @@ def test_tools_list_exposes_harness_tools_and_no_ping(server_params):
     assert re.search(r"(only|just)\W+(\w+\W+){0,4}(advance|grow|increase|change)", poll_desc) and (
         "running" in poll_desc
     ), "poll description must say the progress fields only advance while RUNNING"
+    send_desc = desc["harness_send_message"]
+    assert re.search(r"(only|just)\W+(\w+\W+){0,4}(finished|terminal|completed)", send_desc), (
+        "send_message description must say it is only for finished runs"
+    )
+    assert re.search(r"new\W+(\w+\W+){0,2}run(_id)?", send_desc), (
+        "send_message description must say it returns a new run / run_id"
+    )
+    assert re.search(r"isolation[^.]*(preserv|kept|keeps|retain|inherit)", send_desc), (
+        "send_message description must say the origin run's isolation is preserved"
+    )
+    assert "harness_wait_run" in send_desc and "harness_poll_run" in send_desc, (
+        "send_message description must point to harness_wait_run / harness_poll_run"
+    )
     for name in ("harness_start_agent", "harness_start_prompt"):
         assert re.search(r"label[^.]*harness_list_runs|harness_list_runs[^.]*label", desc[name]), (
             f"{name} description must say the label shows up in harness_list_runs"
@@ -554,3 +568,64 @@ def test_list_agents_uses_session_cwd_and_respects_disabled_plugins(
     assert "beta:helper" not in by_name
     assert explicit[0] is False, explicit[1]
     assert os.path.samefile(explicit[2]["cwd"], tmp_path / "elsewhere")
+
+
+# --- harness_send_message (#5) ------------------------------------------------------
+
+
+def test_send_message_resumes_finished_run(server_params, argv_log):
+    async def scenario(session):
+        is_error, text, started = await _call(
+            session, "harness_start_prompt", prompt="Say OK.", model="sonnet"
+        )
+        assert not is_error, text
+        origin = await _poll_until_terminal(session, started["run_id"])
+        sent = await _call(session, "harness_send_message", run_id=origin["run_id"], prompt="ECHO:BANANA")
+        assert not sent[0], sent[1]
+        waited = await _call(session, "harness_wait_run", run_id=sent[2]["run_id"], timeout_seconds=30)
+        return origin, sent[2], waited
+
+    origin, sent, waited = _run(scenario, server_params)
+    assert origin["state"] == "COMPLETED"
+    assert sent["run_id"] != origin["run_id"]
+    assert sent["session_id"] == origin["session_id"]
+    assert sent["state"] == "RUNNING"
+    assert sent["resumed_from"] == origin["run_id"]
+    assert waited[0] is False, waited[1]
+    assert waited[2]["state"] == "COMPLETED"
+    assert waited[2]["text"] == "BANANA"
+    records = _argv_records(argv_log)
+    assert len(records) == 2
+    assert _flag(records[1]["argv"], "--resume") == origin["session_id"]
+
+
+def test_send_message_error_paths(server_params, argv_log):
+    async def scenario(session):
+        unknown = await _call(session, "harness_send_message", run_id="does-not-exist", prompt="hi")
+        _, _, sleeper = await _call(session, "harness_start_prompt", prompt="SLEEP:30", model="sonnet")
+        running = await _call(session, "harness_send_message", run_id=sleeper["run_id"], prompt="hi")
+        await _call(session, "harness_stop_run", run_id=sleeper["run_id"])
+        _, _, quick = await _call(session, "harness_start_prompt", prompt="Say OK.", model="sonnet")
+        await _poll_until_terminal(session, quick["run_id"])
+        before = len(_argv_records(argv_log))
+        empty = await _call(session, "harness_send_message", run_id=quick["run_id"], prompt="")
+        after = len(_argv_records(argv_log))
+        await _call(session, "harness_cleanup_run", run_id=quick["run_id"])
+        cleaned = await _call(session, "harness_send_message", run_id=quick["run_id"], prompt="hi")
+        alive = await _call(session, "harness_list_runs")
+        return unknown, running, empty, before, after, cleaned, alive
+
+    unknown, running, empty, before, after, cleaned, alive = _run(scenario, server_params)
+    assert unknown[0] is True
+    assert "HarnessError" in unknown[1]
+    assert "does-not-exist" in unknown[1]
+    assert running[0] is True
+    assert "HarnessError" in running[1]
+    assert "RUNNING" in running[1]
+    assert empty[0] is True
+    assert "HarnessError" in empty[1]
+    assert "empty" in empty[1]
+    assert after == before, "an empty prompt must not spawn a child"
+    assert cleaned[0] is True
+    assert "HarnessError" in cleaned[1]
+    assert alive[0] is False, alive[1]
