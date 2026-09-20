@@ -229,27 +229,49 @@ if ($IsWindows) {
     chmod +x "bin/$ExeName"
 }
 
-# 6. Smoke-test: MCP initialize handshake.
-# PowerShell 5.1's Process StreamWriter prepends a UTF-8 BOM that MCP rejects.
-# Work around it by staging the request in a temp file and using
-# Start-Process -RedirectStandardInput, which pipes raw OS bytes.
+# 6. Smoke-test: MCP initialize handshake + tools/list.
+# stdin must stay OPEN until the tools/list reply arrives: on EOF the server tears its
+# transport down, racing (and on slow runners losing) any reply still being produced.
+# Raw bytes go through StandardInput.BaseStream because PowerShell 5.1's StreamWriter
+# prepends a UTF-8 BOM that MCP rejects.
 Write-Step "Smoke-testing the binary (MCP initialize + tools/list)"
 $initMsg = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"build-smoke","version":"1"}}}'
 $initializedMsg = '{"jsonrpc":"2.0","method":"notifications/initialized"}'
 $listMsg = '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
-$inFile = [System.IO.Path]::GetTempFileName()
-$outFile = [System.IO.Path]::GetTempFileName()
-$errFile = [System.IO.Path]::GetTempFileName()
-[System.IO.File]::WriteAllBytes($inFile, [System.Text.Encoding]::UTF8.GetBytes($initMsg + "`n" + $initializedMsg + "`n" + $listMsg + "`n"))
-$proc = Start-Process -FilePath "bin/$ExeName" `
-    -RedirectStandardInput $inFile `
-    -RedirectStandardOutput $outFile `
-    -RedirectStandardError $errFile `
-    -NoNewWindow -PassThru
-if (-not $proc.WaitForExit(15000)) { $proc.Kill(); Start-Sleep -Milliseconds 200 }
-$stdout = (Get-Content -Raw -ErrorAction SilentlyContinue $outFile)
-$stderrText = (Get-Content -Raw -ErrorAction SilentlyContinue $errFile)
-Remove-Item -ErrorAction SilentlyContinue $inFile, $outFile, $errFile
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = (Join-Path $root "bin/$ExeName")
+$psi.UseShellExecute = $false
+$psi.CreateNoWindow = $true
+$psi.RedirectStandardInput = $true
+$psi.RedirectStandardOutput = $true
+$psi.RedirectStandardError = $true
+$bomAbsorber = ""
+try {
+    $psi.StandardInputEncoding = New-Object System.Text.UTF8Encoding($false)
+} catch {
+    # Windows PowerShell 5.1 (.NET Framework) lacks the property and prepends a BOM to the
+    # first write: let it land on a blank line the server ignores instead of on the JSON.
+    $bomAbsorber = "`n"
+}
+$proc = [System.Diagnostics.Process]::Start($psi)
+$errTask = $proc.StandardError.ReadToEndAsync()
+$reqBytes = [System.Text.Encoding]::UTF8.GetBytes($bomAbsorber + $initMsg + "`n" + $initializedMsg + "`n" + $listMsg + "`n")
+$proc.StandardInput.BaseStream.Write($reqBytes, 0, $reqBytes.Length)
+$proc.StandardInput.BaseStream.Flush()
+$stdout = ""
+$lineTask = $null
+$deadline = (Get-Date).AddSeconds(60)
+while ((Get-Date) -lt $deadline -and $stdout -notmatch 'harness_list_agents') {
+    if ($null -eq $lineTask) { $lineTask = $proc.StandardOutput.ReadLineAsync() }
+    if (-not $lineTask.Wait(5000)) { continue }
+    $line = $lineTask.Result
+    $lineTask = $null
+    if ($null -eq $line) { break }
+    $stdout += $line + "`n"
+}
+try { $proc.StandardInput.Close() } catch {}
+if (-not $proc.WaitForExit(10000)) { $proc.Kill(); Start-Sleep -Milliseconds 200 }
+$stderrText = if ($errTask.Wait(5000)) { $errTask.Result } else { "" }
 if ($stdout -match '"result"' -and $stdout -match '"protocolVersion"' -and $stdout -match 'harness_list_agents') {
     Write-Host "    handshake + tools/list OK" -ForegroundColor Green
 } else {
