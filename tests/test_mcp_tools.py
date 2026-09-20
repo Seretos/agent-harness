@@ -1,12 +1,14 @@
 """MCP-level tests: a real `python -m harness_plugin` server over stdio,
 talking to the fake claude CLI from tests/fixtures/fake_claude.py."""
 import json
+import os
 import sys
 import time
 from contextlib import asynccontextmanager
 
 import anyio
 import pytest
+from conftest import SESSION_ID, plant_session_file
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client
 
@@ -261,3 +263,165 @@ def test_wait_run_does_not_block_other_tool_calls(server_params, project_dir):
     assert listed[0] is False, listed[1]
     assert still_waiting, "list_agents only returned after the wait finished"
     assert waited[2]["state"] == "CANCELLED"
+
+
+# --- parent-session HostContext wiring (#1) ---------------------------------------
+
+
+def _argv_records(log):
+    assert log.exists(), "fake claude was never invoked (no argv log)"
+    return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines() if line]
+
+
+def _flag(argv, name):
+    assert name in argv, f"{name} missing from CLI argv: {argv}"
+    return argv[argv.index(name) + 1]
+
+
+def _start_and_finish(params, **arguments):
+    async def scenario(session):
+        is_error, text, started = await _call(session, "harness_start_agent", **arguments)
+        assert not is_error, text
+        return started, await _poll_until_terminal(session, started["run_id"])
+
+    return _run(scenario, params)
+
+
+def test_start_agent_inherits_session_context(server_params, session_context, argv_log):
+    started, final = _start_and_finish(server_params, agent="demo")
+    assert final["state"] == "COMPLETED"
+    assert started["context_source"] == "session"
+    (record,) = _argv_records(argv_log)
+    assert _flag(record["argv"], "--permission-mode") == "acceptEdits"
+    assert _flag(record["argv"], "--effort") == "high"
+    assert _flag(record["argv"], "--model") == "opus"
+    assert os.path.samefile(record["cwd"], session_context["cwd"])
+    assert os.path.samefile(started["cwd"], session_context["cwd"])
+
+
+def test_start_agent_explicit_arguments_override_session_context(
+    server_params, session_context, argv_log
+):
+    _start_and_finish(
+        server_params, agent="demo", permission_mode="plan", model="sonnet", effort="low"
+    )
+    (record,) = _argv_records(argv_log)
+    assert _flag(record["argv"], "--permission-mode") == "plan"
+    assert _flag(record["argv"], "--effort") == "low"
+    assert _flag(record["argv"], "--model") == "sonnet"
+
+
+def test_start_agent_falls_back_to_newest_context_of_project_dir(
+    server_params, session_context, argv_log
+):
+    env = dict(server_params.env)
+    del env["CLAUDE_CODE_SESSION_ID"]
+    env["CLAUDE_PROJECT_DIR"] = session_context["project_dir"]
+    params = server_params.model_copy(update={"env": env})
+
+    started, final = _start_and_finish(params, agent="demo")
+    assert final["state"] == "COMPLETED"
+    assert started["context_source"] == "fallback"
+    (record,) = _argv_records(argv_log)
+    assert _flag(record["argv"], "--permission-mode") == "acceptEdits"
+
+
+@pytest.mark.parametrize("explicit_mode", [None, "acceptEdits"], ids=["no-args", "explicit-mode"])
+def test_start_agent_refuses_without_session_context(
+    server_params_no_context, project_dir, argv_log, explicit_mode
+):
+    args = {"agent": "demo", "cwd": str(project_dir), "model": "sonnet"}
+    if explicit_mode:
+        args["permission_mode"] = explicit_mode
+
+    async def scenario(session):
+        return await _call(session, "harness_start_agent", **args)
+
+    is_error, text, _ = _run(scenario, server_params_no_context)
+    assert is_error, "start_agent must refuse when no session context can be resolved"
+    assert "CLAUDE_CODE_SESSION_ID" in text
+    assert not argv_log.exists(), "a child was started on unconfirmed rights"
+
+
+def test_start_agent_refuses_context_without_permission_mode(
+    server_params, tmp_path, project_dir, argv_log
+):
+    # A SessionStart-only snapshot resolves, but carries no permission_mode.
+    plant_session_file(tmp_path / "plugin-data", SESSION_ID, cwd=str(project_dir))
+
+    async def scenario(session):
+        return await _call(
+            session, "harness_start_agent", agent="demo", cwd=str(project_dir), model="sonnet"
+        )
+
+    is_error, text, _ = _run(scenario, server_params)
+    assert is_error, "a resolved context lacking permission_mode must not start a child"
+    assert "permission_mode" in text
+    assert not argv_log.exists()
+
+
+def test_list_agents_and_start_prompt_work_without_context(server_params_no_context, project_dir):
+    async def scenario(session):
+        listed = await _call(session, "harness_list_agents", cwd=str(project_dir))
+        prompt = await _call(session, "harness_start_prompt", prompt="Say OK.", model="sonnet")
+        return listed, prompt
+
+    listed, prompt = _run(scenario, server_params_no_context)
+    assert listed[0] is False, listed[1]
+    assert prompt[0] is False, prompt[1]
+
+
+def test_probe_warning_goes_to_stderr_not_stdout(server_params_no_context, tmp_path):
+    errlog_path = tmp_path / "server-stderr.log"
+
+    async def main():
+        with anyio.fail_after(60):
+            with open(errlog_path, "w", encoding="utf-8") as errlog:
+                async with stdio_client(server_params_no_context, errlog=errlog) as (read, write):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()  # stdout stayed valid JSON-RPC
+
+    anyio.run(main)
+    assert "CLAUDE_CODE_SESSION_ID" in errlog_path.read_text(encoding="utf-8")
+
+
+def test_list_agents_uses_session_cwd_and_respects_disabled_plugins(
+    server_params, session_context, project_dir, tmp_path
+):
+    config = tmp_path / "claude-config"
+    installs = {}
+    for name in ("alpha", "beta"):
+        agents = tmp_path / "plugins" / name / "agents"
+        agents.mkdir(parents=True)
+        (agents / "helper.md").write_text(
+            f"---\nname: helper\ndescription: {name} helper\n---\nDo it.\n",
+            encoding="utf-8",
+        )
+        installs[f"{name}@mk"] = [
+            {"scope": "user", "installPath": str(tmp_path / "plugins" / name)}
+        ]
+    (config / "plugins").mkdir()
+    (config / "plugins" / "installed_plugins.json").write_text(
+        json.dumps({"version": 2, "plugins": installs}), encoding="utf-8"
+    )
+    (config / "settings.json").write_text(
+        json.dumps({"enabledPlugins": {"alpha@mk": True, "beta@mk": True}}), encoding="utf-8"
+    )
+    (project_dir / ".claude" / "settings.local.json").write_text(
+        json.dumps({"enabledPlugins": {"beta@mk": False}}), encoding="utf-8"
+    )
+
+    async def scenario(session):
+        implicit = await _call(session, "harness_list_agents")
+        explicit = await _call(session, "harness_list_agents", cwd=str(tmp_path / "elsewhere"))
+        return implicit, explicit
+
+    implicit, explicit = _run(scenario, server_params)
+    assert implicit[0] is False, implicit[1]
+    by_name = {a["qualified_name"]: a for a in implicit[2]["agents"]}
+    assert os.path.samefile(implicit[2]["cwd"], session_context["cwd"])
+    assert by_name["demo"]["source_scope"] == "project"
+    assert by_name["alpha:helper"]["source_scope"] == "plugin"
+    assert "beta:helper" not in by_name
+    assert explicit[0] is False, explicit[1]
+    assert not os.path.samefile(explicit[2]["cwd"], session_context["cwd"])
