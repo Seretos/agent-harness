@@ -26,7 +26,7 @@ from harness_plugin.host_context import (
     probe_warning,
     sessions_dir,
 )
-from harness_plugin.runs import artifacts_root, harness, run_to_dict
+from harness_plugin.runs import artifacts_root, harness, run_to_dict, summary_to_dict
 
 mcp = FastMCP("harness")
 
@@ -92,12 +92,14 @@ def harness_start_agent(
     model: str | None = None,
     permission_mode: str | None = None,
     effort: str | None = None,
+    label: str | None = None,
 ) -> dict[str, Any]:
     """Start a discovered subagent (by qualified_name) as a background run and return its
     run_id immediately; use harness_poll_run or harness_wait_run for the result. The run
     inherits the parent session's permission mode, model, effort and cwd (collected by the
     plugin hook); explicit arguments override them. Refuses when the session context cannot
-    be determined. `context_source`, `cwd`, `permission_mode` and `model` are echoed back."""
+    be determined. `context_source`, `cwd`, `permission_mode` and `model` are echoed back.
+    An optional short `label` names the run and shows up in harness_list_runs."""
     data, source = load_session_context()
     if data is None:
         raise ToolError(
@@ -132,6 +134,7 @@ def harness_start_agent(
             f"no model for agent {agent!r}: pass `model` or set `model:` in its definition"
         )
     spec.cwd = used
+    spec.label = label
     spec.artifacts_dir = artifacts_root()
     return run_to_dict(
         harness().start(spec),
@@ -150,10 +153,12 @@ def harness_start_prompt(
     effort: str | None = None,
     system_prompt: str | None = None,
     cwd: str | None = None,
+    label: str | None = None,
 ) -> dict[str, Any]:
     """Start an ad-hoc prompt in a clean (no memory, no project config) run and return its
     run_id immediately. With `cwd` unset the run gets a fresh empty temp directory; a given
-    `cwd` must exist, be empty and not sit inside a git repository."""
+    `cwd` must exist, be empty and not sit inside a git repository. An optional short `label` names the run and shows up in
+    harness_list_runs."""
     spec = RunSpec(
         prompt=prompt,
         isolation=Isolation.CLEAN,
@@ -161,6 +166,7 @@ def harness_start_prompt(
         effort=effort,
         system_prompt=system_prompt,
         cwd=cwd,
+        label=label,
         artifacts_dir=artifacts_root(),
     )
     return run_to_dict(harness().start(spec))
@@ -169,8 +175,21 @@ def harness_start_prompt(
 @mcp.tool()
 @_tool_errors
 def harness_poll_run(run_id: str) -> dict[str, Any]:
-    """Return the current state (and result, once finished) of a run without blocking."""
+    """Return the current state (and result, once finished) of a run without blocking.
+    While the run is RUNNING, `event_count` and `last_event_at` show progress: they only
+    advance while `state` is RUNNING, so a growing count means the run is working and a
+    frozen one means it may be hung; once the run is terminal they reset to 0 and None."""
     return run_to_dict(harness().poll(run_id))
+
+
+@mcp.tool()
+@_tool_errors
+def harness_list_runs() -> dict[str, Any]:
+    """List all recorded runs as compact rows (run_id, state, model, cwd, created_at, label).
+    Use it when you lost the run_id (e.g. after context compaction) to find a run again,
+    then pass it to harness_stop_run, harness_poll_run or harness_cleanup_run. Rows
+    deliberately carry no result text or usage; poll a run for those."""
+    return {"runs": [summary_to_dict(s) for s in harness().list_runs()]}
 
 
 @mcp.tool()

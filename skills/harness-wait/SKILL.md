@@ -24,7 +24,7 @@ instead: its timeout only stops the waiting, never the run.
    `--timeout` is required. `--interval` (default 2, minimum 0.2) is the poll cadence.
 4. You are notified when the command exits. Read its stdout: exactly one JSON object shaped
    like a `harness_poll_run` result, plus `waited_s` (seconds actually waited).
-5. Afterwards call `harness_cleanup_run` to forget the run record.
+5. If you lost the `run_id` (e.g. after context compaction), find the run with `harness_list_runs` first. Afterwards call `harness_cleanup_run` to forget the run record.
 
 ## Exit codes
 

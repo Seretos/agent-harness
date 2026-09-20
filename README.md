@@ -54,6 +54,8 @@ Output on Windows: `bin/harness.exe`. On Linux: `bin/harness`. Then install via 
 harness wait-run --run-id <id> --timeout <seconds> [--interval <seconds>]
 ```
 
+`harness_list_runs` lists all recorded runs as compact rows (`run_id`, `state`, `model`, `cwd`, `created_at`, `label`; no text or usage) so a lost `run_id` can be found again; `harness_start_prompt`/`harness_start_agent` accept an optional `label`, and `harness_poll_run` reports `event_count`/`last_event_at` while a run is RUNNING.
+
 It prints one `harness_poll_run`-shaped JSON object plus `waited_s` on stdout and never cancels the run. `--timeout` is required; `--interval` defaults to 2 (minimum 0.2).
 
 | exit code | meaning |

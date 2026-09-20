@@ -55,6 +55,20 @@ def run_to_dict(result: Any, **extra: Any) -> dict[str, Any]:
         "cost": result.cost,
         "transcript_path": jsonable(result.transcript_path),
         "duration_s": result.duration_s,
+        "event_count": result.event_count,
+        "last_event_at": result.last_event_at,
     }
     out.update(extra)
     return out
+
+
+def summary_to_dict(summary: Any) -> dict[str, Any]:
+    """Compact list row: identifying fields only, deliberately no text/usage."""
+    return {
+        "run_id": summary.run_id,
+        "state": jsonable(summary.state),
+        "model": summary.model,
+        "cwd": jsonable(summary.cwd),
+        "created_at": summary.created_at,
+        "label": summary.label,
+    }
