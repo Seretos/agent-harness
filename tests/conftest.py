@@ -8,25 +8,74 @@ from mcp import StdioServerParameters
 FAKE_CLAUDE = Path(__file__).parent / "fixtures" / "fake_claude.py"
 
 
-@pytest.fixture
-def server_params(tmp_path) -> StdioServerParameters:
-    """A real `python -m harness_plugin` server wired to the fake claude CLI,
-    with artifacts and user-level config isolated under tmp_path."""
+SESSION_ID = "test-session"
+
+
+def plant_session_file(plugin_data: Path, session_id: str, **fields) -> Path:
+    """Write what the hook would: <CLAUDE_PLUGIN_DATA>/sessions/<session_id>.json."""
+    sessions = plugin_data / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    path = sessions / f"{session_id}.json"
+    path.write_text(json.dumps({"session_id": session_id, **fields}), encoding="utf-8")
+    return path
+
+
+def _base_env(tmp_path) -> dict[str, str]:
     config_dir = tmp_path / "claude-config"
     home = tmp_path / "home"
-    config_dir.mkdir()
-    home.mkdir()
-    return StdioServerParameters(
-        command=sys.executable,
-        args=["-m", "harness_plugin"],
-        env={
-            "HARNESS_CLAUDE_ARGV": json.dumps([sys.executable, str(FAKE_CLAUDE)]),
-            "HARNESS_ARTIFACTS_DIR": str(tmp_path / "artifacts"),
-            "CLAUDE_CONFIG_DIR": str(config_dir),
-            "HOME": str(home),
-            "USERPROFILE": str(home),
-        },
-    )
+    config_dir.mkdir(exist_ok=True)
+    home.mkdir(exist_ok=True)
+    return {
+        "HARNESS_CLAUDE_ARGV": json.dumps([sys.executable, str(FAKE_CLAUDE)]),
+        "HARNESS_ARTIFACTS_DIR": str(tmp_path / "artifacts"),
+        "HARNESS_FAKE_ARGV_LOG": str(tmp_path / "argv.log"),
+        "CLAUDE_CONFIG_DIR": str(config_dir),
+        "CLAUDE_PLUGIN_DATA": str(tmp_path / "plugin-data"),
+        "HOME": str(home),
+        "USERPROFILE": str(home),
+    }
+
+
+def _params(env) -> StdioServerParameters:
+    return StdioServerParameters(command=sys.executable, args=["-m", "harness_plugin"], env=env)
+
+
+@pytest.fixture
+def session_context(tmp_path, project_dir) -> dict:
+    """The parent-session snapshot the hook would have collected, planted on disk."""
+    ctx = {
+        "session_id": SESSION_ID,
+        "cwd": str(project_dir),
+        "project_dir": str(project_dir),
+        "permission_mode": "acceptEdits",
+        "effort": "high",
+        "model": "opus",
+    }
+    plant_session_file(tmp_path / "plugin-data", **ctx)
+    return ctx
+
+
+@pytest.fixture
+def argv_log(tmp_path) -> Path:
+    """Where fake_claude records the argv/cwd of every real (non --version) invocation."""
+    return tmp_path / "argv.log"
+
+
+@pytest.fixture
+def server_params(tmp_path, session_context) -> StdioServerParameters:
+    """A real `python -m harness_plugin` server wired to the fake claude CLI, with
+    artifacts and user-level config isolated under tmp_path and a parent-session
+    context planted and resolvable via CLAUDE_CODE_SESSION_ID."""
+    env = _base_env(tmp_path)
+    env["CLAUDE_CODE_SESSION_ID"] = SESSION_ID
+    return _params(env)
+
+
+@pytest.fixture
+def server_params_no_context(tmp_path) -> StdioServerParameters:
+    """Same server, but no session id, no project dir and an empty sessions dir:
+    no context can be resolved."""
+    return _params(_base_env(tmp_path))
 
 
 @pytest.fixture

@@ -4,9 +4,12 @@ Answers `--version`; otherwise reads the prompt from stdin and emits the
 stream-json events `lib_python_harness` parses (a terminal `result` event
 carrying `result` and `session_id`). A prompt containing `SLEEP:<seconds>`
 keeps the process alive first, so one fixture yields both a fast run and a
-still-RUNNING run.
+still-RUNNING run. With HARNESS_FAKE_ARGV_LOG set, each real invocation appends
+one JSON line {"argv": [...], "cwd": ...} so tests can assert which flags and
+working directory the CLI actually received.
 """
 import json
+import os
 import re
 import sys
 import time
@@ -17,6 +20,11 @@ def main() -> int:
     if "--version" in argv:
         print("2.0.0 (Claude Code)")
         return 0
+
+    log = os.environ.get("HARNESS_FAKE_ARGV_LOG")
+    if log:
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"argv": argv, "cwd": os.getcwd()}) + "\n")
 
     session_id = "fake-session"
     if "--session-id" in argv:

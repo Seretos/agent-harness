@@ -5,6 +5,7 @@ import functools
 import inspect
 import json
 import os
+import sys
 from enum import Enum
 from functools import partial
 from pathlib import Path
@@ -23,6 +24,13 @@ from lib_python_harness import (
 )
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+
+from harness_plugin.host_context import (
+    build_host_context,
+    load_session_context,
+    probe_warning,
+    sessions_dir,
+)
 
 mcp = FastMCP("harness")
 
@@ -102,11 +110,19 @@ def _run_to_dict(result: Any, **extra: Any) -> dict[str, Any]:
 @_tool_errors
 def harness_list_agents(cwd: str | None = None) -> dict[str, Any]:
     """List the subagent definitions (project, user and plugin scope) visible from `cwd`
-    (default: the server's working directory). The used cwd is echoed back."""
-    used = cwd or os.getcwd()
+    (default: the parent session's cwd, else CLAUDE_PROJECT_DIR, else the server's working
+    directory). The used cwd and the `context_source` are echoed back."""
+    data, source = load_session_context()
+    used = (
+        cwd
+        or (data or {}).get("cwd")
+        or os.environ.get("CLAUDE_PROJECT_DIR")
+        or os.getcwd()
+    )
     found = discover(HostContext(cwd=used))
     return {
         "cwd": used,
+        "context_source": source,
         "agents": [
             {
                 "qualified_name": name,
@@ -131,11 +147,31 @@ def harness_start_agent(
     effort: str | None = None,
 ) -> dict[str, Any]:
     """Start a discovered subagent (by qualified_name) as a background run and return its
-    run_id immediately; use harness_poll_run or harness_wait_run for the result. `model`
-    overrides the definition's model; one of the two is required. `cwd` defaults to the
-    server's working directory and is echoed back."""
-    used = cwd or os.getcwd()
-    ctx = HostContext(cwd=used, model=model, permission_mode=permission_mode, effort=effort)
+    run_id immediately; use harness_poll_run or harness_wait_run for the result. The run
+    inherits the parent session's permission mode, model, effort and cwd (collected by the
+    plugin hook); explicit arguments override them. Refuses when the session context cannot
+    be determined. `context_source`, `cwd`, `permission_mode` and `model` are echoed back."""
+    data, source = load_session_context()
+    if data is None:
+        raise ToolError(
+            "cannot determine the parent session's context: CLAUDE_CODE_SESSION_ID is not "
+            "set or no matching session file exists in the sessions dir "
+            f"({sessions_dir()}); refusing to start a child on unconfirmed rights"
+        )
+    # Refusal rules: no session file at all (above) refuses unconditionally, even with an
+    # explicit permission_mode. A SessionStart-only snapshot refuses only when the EFFECTIVE
+    # mode (explicit argument, else file value) is missing. No cwd => cannot resolve the agent.
+    if not (permission_mode or data.get("permission_mode")):
+        raise ToolError(
+            "the parent session's context carries no permission_mode yet (only a "
+            "SessionStart snapshot exists); refusing to start a child on unconfirmed rights"
+        )
+    used = cwd or data.get("cwd") or data.get("project_dir")
+    if not used:
+        raise ToolError("the parent session's context carries no cwd; pass `cwd`")
+    ctx = build_host_context(
+        data, used, model=model, permission_mode=permission_mode, effort=effort
+    )
     definitions = discover(ctx)
     definition = definitions.get(agent)
     if definition is None:
@@ -150,7 +186,13 @@ def harness_start_agent(
         )
     spec.cwd = used
     spec.artifacts_dir = _artifacts_root()
-    return _run_to_dict(_harness().start(spec), cwd=used)
+    return _run_to_dict(
+        _harness().start(spec),
+        cwd=used,
+        context_source=source,
+        permission_mode=ctx.permission_mode,
+        model=spec.model,
+    )
 
 
 @mcp.tool()
@@ -210,4 +252,7 @@ def harness_cleanup_run(run_id: str) -> dict[str, Any]:
 
 
 def main() -> None:
+    warning = probe_warning()
+    if warning:
+        print(warning, file=sys.stderr, flush=True)  # stdout is the MCP transport
     mcp.run()

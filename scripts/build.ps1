@@ -229,27 +229,49 @@ if ($IsWindows) {
     chmod +x "bin/$ExeName"
 }
 
-# 6. Smoke-test: MCP initialize handshake.
-# PowerShell 5.1's Process StreamWriter prepends a UTF-8 BOM that MCP rejects.
-# Work around it by staging the request in a temp file and using
-# Start-Process -RedirectStandardInput, which pipes raw OS bytes.
+# 6. Smoke-test: MCP initialize handshake + tools/list.
+# stdin must stay OPEN until the tools/list reply arrives: on EOF the server tears its
+# transport down, racing (and on slow runners losing) any reply still being produced.
+# Raw bytes go through StandardInput.BaseStream because PowerShell 5.1's StreamWriter
+# prepends a UTF-8 BOM that MCP rejects.
 Write-Step "Smoke-testing the binary (MCP initialize + tools/list)"
 $initMsg = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"build-smoke","version":"1"}}}'
 $initializedMsg = '{"jsonrpc":"2.0","method":"notifications/initialized"}'
 $listMsg = '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
-$inFile = [System.IO.Path]::GetTempFileName()
-$outFile = [System.IO.Path]::GetTempFileName()
-$errFile = [System.IO.Path]::GetTempFileName()
-[System.IO.File]::WriteAllBytes($inFile, [System.Text.Encoding]::UTF8.GetBytes($initMsg + "`n" + $initializedMsg + "`n" + $listMsg + "`n"))
-$proc = Start-Process -FilePath "bin/$ExeName" `
-    -RedirectStandardInput $inFile `
-    -RedirectStandardOutput $outFile `
-    -RedirectStandardError $errFile `
-    -NoNewWindow -PassThru
-if (-not $proc.WaitForExit(15000)) { $proc.Kill(); Start-Sleep -Milliseconds 200 }
-$stdout = (Get-Content -Raw -ErrorAction SilentlyContinue $outFile)
-$stderrText = (Get-Content -Raw -ErrorAction SilentlyContinue $errFile)
-Remove-Item -ErrorAction SilentlyContinue $inFile, $outFile, $errFile
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = (Join-Path $root "bin/$ExeName")
+$psi.UseShellExecute = $false
+$psi.CreateNoWindow = $true
+$psi.RedirectStandardInput = $true
+$psi.RedirectStandardOutput = $true
+$psi.RedirectStandardError = $true
+$bomAbsorber = ""
+try {
+    $psi.StandardInputEncoding = New-Object System.Text.UTF8Encoding($false)
+} catch {
+    # Windows PowerShell 5.1 (.NET Framework) lacks the property and prepends a BOM to the
+    # first write: let it land on a blank line the server ignores instead of on the JSON.
+    $bomAbsorber = "`n"
+}
+$proc = [System.Diagnostics.Process]::Start($psi)
+$errTask = $proc.StandardError.ReadToEndAsync()
+$reqBytes = [System.Text.Encoding]::UTF8.GetBytes($bomAbsorber + $initMsg + "`n" + $initializedMsg + "`n" + $listMsg + "`n")
+$proc.StandardInput.BaseStream.Write($reqBytes, 0, $reqBytes.Length)
+$proc.StandardInput.BaseStream.Flush()
+$stdout = ""
+$lineTask = $null
+$deadline = (Get-Date).AddSeconds(60)
+while ((Get-Date) -lt $deadline -and $stdout -notmatch 'harness_list_agents') {
+    if ($null -eq $lineTask) { $lineTask = $proc.StandardOutput.ReadLineAsync() }
+    if (-not $lineTask.Wait(5000)) { continue }
+    $line = $lineTask.Result
+    $lineTask = $null
+    if ($null -eq $line) { break }
+    $stdout += $line + "`n"
+}
+try { $proc.StandardInput.Close() } catch {}
+if (-not $proc.WaitForExit(10000)) { $proc.Kill(); Start-Sleep -Milliseconds 200 }
+$stderrText = if ($errTask.Wait(5000)) { $errTask.Result } else { "" }
 if ($stdout -match '"result"' -and $stdout -match '"protocolVersion"' -and $stdout -match 'harness_list_agents') {
     Write-Host "    handshake + tools/list OK" -ForegroundColor Green
 } else {
@@ -257,6 +279,40 @@ if ($stdout -match '"result"' -and $stdout -match '"protocolVersion"' -and $stdo
     Write-Host "    stderr: $stderrText" -ForegroundColor Yellow
     Fail "Handshake failed -- see output above."
 }
+
+# 6b. Smoke-test: the registered hook command string, run through the host shell.
+# Reads `command` from hooks/hooks.json verbatim (only ${CLAUDE_PLUGIN_ROOT} substituted)
+# and runs it via cmd.exe /c (Windows) or /bin/sh -c (Linux) with a PreToolUse payload on
+# stdin, proving the extensionless command word resolves to the frozen binary.
+Write-Step "Smoke-testing the registered hook command (via the OS shell)"
+$hooksJson = Get-Content -Raw (Join-Path $root "hooks/hooks.json") | ConvertFrom-Json
+$hookCmd = $hooksJson.hooks.PreToolUse[0].hooks[0].command
+$hookCmd = $hookCmd.Replace('${CLAUDE_PLUGIN_ROOT}', $root)
+$hookData = Join-Path ([System.IO.Path]::GetTempPath()) ("harness-hook-smoke-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Force -Path $hookData | Out-Null
+$hookIn = [System.IO.Path]::GetTempFileName()
+$hookPayload = '{"session_id":"build-smoke","cwd":"x","permission_mode":"acceptEdits","hook_event_name":"PreToolUse"}'
+[System.IO.File]::WriteAllBytes($hookIn, [System.Text.Encoding]::UTF8.GetBytes($hookPayload))
+$prevData = $env:CLAUDE_PLUGIN_DATA
+$env:CLAUDE_PLUGIN_DATA = $hookData
+try {
+    if ($IsWindows) {
+        $hookOut = & cmd.exe /c "$hookCmd < `"$hookIn`"" 2>&1
+    } else {
+        $hookOut = & /bin/sh -c "$hookCmd < '$hookIn'" 2>&1
+    }
+} finally {
+    $env:CLAUDE_PLUGIN_DATA = $prevData
+}
+$hookFile = Join-Path $hookData "sessions/build-smoke.json"
+if ((Test-Path $hookFile) -and ((Get-Content -Raw $hookFile) -match 'acceptEdits')) {
+    Write-Host "    hook command wrote sessions/build-smoke.json OK" -ForegroundColor Green
+} else {
+    Write-Host "    command: $hookCmd" -ForegroundColor Yellow
+    Write-Host "    output: $hookOut" -ForegroundColor Yellow
+    Fail "Hook smoke failed -- the registered hook command did not produce a session file. Fallback: add a bin/harness.exe hook entry."
+}
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $hookData, $hookIn
 
 # 7. Optional: stage build/stage/agent-harness/ for the assembly step in
 # release.yml. NOTE: -Package on its own emits a *partial* stage tree
@@ -271,6 +327,10 @@ if ($Package) {
     Copy-Item -Recurse -Force "bin" $stage
     if (Test-Path "skills") {
         Copy-Item -Recurse -Force "skills" $stage
+    }
+    Copy-Item -Recurse -Force "hooks" $stage
+    if (-not (Test-Path (Join-Path $stage "hooks/hooks.json"))) {
+        Fail "hooks/hooks.json was not staged."
     }
     Copy-Item -Force "README.md" $stage -ErrorAction SilentlyContinue
     Copy-Item -Force "LICENSE" $stage -ErrorAction SilentlyContinue

@@ -3,6 +3,7 @@
   "description": "Provider-independent subagent system for coding agents - replaces the host's built-in subagent tool calls.",
   "version": "0.0.0",
   "author": { "name": "Arne von Appen" },
+  "hooks": "./hooks/hooks.json",
   "mcpServers": {
     "harness": {
       "command": "${CLAUDE_PLUGIN_ROOT}/bin/harness",
