@@ -22,6 +22,17 @@ def _spawn(cmd, env, *args):
     )
 
 
+def _finish_bounded(proc):
+    """communicate(15); report a "blocked" sentinel instead of hanging if the CLI keeps waiting."""
+    try:
+        out, err = proc.communicate(timeout=15)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, err = proc.communicate()
+        return "blocked", out, err
+    return proc.returncode, out, err
+
+
 def _finish(proc):
     out, err = proc.communicate(timeout=CLI_TIMEOUT)
     return proc.returncode, out, err
@@ -54,7 +65,7 @@ def test_wait_run_blocks_until_completed_and_exits_zero(server_params, wait_run_
     assert payload["state"] == "COMPLETED"
     assert payload["text"] == "OK"
     assert isinstance(payload["waited_s"], (int, float))
-    assert payload["waited_s"] >= 2.5, "returned without waiting for the sleeping run"
+    assert 2.5 <= payload["waited_s"] < 60, "waited_s must be the measured wait, not the flag"
 
 
 def test_timeout_exits_two_and_leaves_run_running(server_params, wait_run_env, wait_run_cmd):
@@ -70,7 +81,9 @@ def test_timeout_exits_two_and_leaves_run_running(server_params, wait_run_env, w
 
     (code, out, err), polled = _run(scenario, server_params)
     assert code == 2, (out, err)
-    assert _one_json(out)["state"] == "RUNNING"
+    timed_out = _one_json(out)
+    assert timed_out["state"] == "RUNNING"
+    assert timed_out["waited_s"] < 10, "waited_s must be the measured wait, not a constant"
     assert polled[0] is False, polled[1]
     assert polled[2]["state"] == "RUNNING", "the wait timeout must not cancel the run"
 
@@ -110,25 +123,9 @@ def test_unknown_run_id_exits_four(wait_run_env, wait_run_cmd):
     assert "no-such-run" in err
 
 
-def test_malformed_flag_exits_four_not_two(wait_run_env, wait_run_cmd):
-    proc = _spawn(wait_run_cmd, wait_run_env, "--run-id", "x", "--timeout", "5", "--bogus")
-    code, out, _ = _finish(proc)
-    assert code == 4
-    assert out.strip() == ""
-
-
 def test_missing_timeout_exits_four_even_for_a_live_run(server_params, wait_run_env, wait_run_cmd):
     """--timeout is REQUIRED. The run id is real and RUNNING, so an implementation that
     defaulted --timeout would block polling (subprocess timeout below) instead of exiting 4."""
-
-    def _finish_bounded(proc):
-        try:
-            out, err = proc.communicate(timeout=15)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            out, err = proc.communicate()
-            return "blocked", out, err
-        return proc.returncode, out, err
 
     async def scenario(session):
         run_id = await _start(session, "SLEEP:30")
@@ -141,3 +138,20 @@ def test_missing_timeout_exits_four_even_for_a_live_run(server_params, wait_run_
     assert code == 4, (code, out, err)
     assert out.strip() == ""
     assert "--timeout" in err, "usage error must name the missing --timeout flag"
+
+
+def test_malformed_flag_exits_four_not_two(server_params, wait_run_env, wait_run_cmd):
+    """Real RUNNING run id, so exit 4 cannot come from the unknown-run path. An implementation
+    that swallowed --bogus (parse_known_args) would wait out --timeout 5 and exit 2."""
+
+    async def scenario(session):
+        run_id = await _start(session, "SLEEP:30")
+        proc = _spawn(wait_run_cmd, wait_run_env, "--run-id", run_id, "--timeout", "5", "--bogus")
+        result = await anyio.to_thread.run_sync(_finish_bounded, proc)
+        await _call(session, "harness_stop_run", run_id=run_id)
+        return result
+
+    code, out, err = _run(scenario, server_params)
+    assert code == 4, (code, out, err)
+    assert out.strip() == ""
+    assert "--bogus" in err, "usage error must name the unrecognised flag"
