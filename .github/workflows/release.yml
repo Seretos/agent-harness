@@ -197,6 +197,9 @@ jobs:
           # so the dispatch payload's icon URL
           # (raw.githubusercontent.com/${repo}/${TAG}/assets/icon.png) resolves.
           [ -d stamped/assets ] && cp -a stamped/assets "$STAGE/" || true
+          # hooks/ registers the session-context hook (plugin.json "hooks" key).
+          cp -a stamped/hooks "$STAGE/"
+          test -f "$STAGE/hooks/hooks.json"
           # description.md ships onto the orphan release branch too, so the
           # dispatch payload's description_url
           # (raw.githubusercontent.com/${repo}/${TAG}/description.md) resolves.

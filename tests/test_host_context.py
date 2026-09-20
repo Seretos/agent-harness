@@ -32,6 +32,8 @@ def test_resolution_prefers_session_id_then_newest_matching_project_dir(hc, tmp_
     _plant(tmp_path, "sess-a.json", 1000, session_id="sess-a", cwd="/proj/a")
     _plant(tmp_path, "sess-b.json", 2000, session_id="sess-b", project_dir="/proj/b")
     _plant(tmp_path, "sess-c.json", 3000, session_id="sess-c", cwd="/proj/b")
+    # Lexicographically greatest but oldest: only an mtime-aware resolver skips it.
+    _plant(tmp_path, "sess-z.json", 500, session_id="sess-z", cwd="/proj/b")
 
     exact, source = hc.load_session_context(
         _env(tmp_path, CLAUDE_CODE_SESSION_ID="sess-a", CLAUDE_PROJECT_DIR="/proj/b")
@@ -41,7 +43,7 @@ def test_resolution_prefers_session_id_then_newest_matching_project_dir(hc, tmp_
 
     fallback, source = hc.load_session_context(_env(tmp_path, CLAUDE_PROJECT_DIR="/proj/b"))
     assert source == "fallback"
-    assert fallback["session_id"] == "sess-c"  # newest of the two matching /proj/b
+    assert fallback["session_id"] == "sess-c"  # newest by mtime of the matching /proj/b files (sess-z is older)
 
     nothing, source = hc.load_session_context(_env(tmp_path, CLAUDE_PROJECT_DIR="/proj/none"))
     assert (nothing, source) == (None, "none")

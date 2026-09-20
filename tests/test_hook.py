@@ -12,7 +12,7 @@ import pytest
 PRE_TOOL_USE = {
     "session_id": "sess-abc",
     "transcript_path": "/tmp/transcripts/sess-abc.jsonl",
-    "cwd": "/work/project",
+    "cwd": "/work/project/subdir",  # differs from CLAUDE_PROJECT_DIR on purpose
     "permission_mode": "acceptEdits",
     "effort": "high",
     "hook_event_name": "PreToolUse",
@@ -46,7 +46,7 @@ def test_hook_writes_session_context(tmp_path):
     assert written.is_file(), f"no session file; stdout={proc.stdout!r} stderr={proc.stderr!r}"
     assert json.loads(written.read_text(encoding="utf-8")) == {
         "session_id": "sess-abc",
-        "cwd": "/work/project",
+        "cwd": "/work/project/subdir",
         "project_dir": "/work/project",
         "permission_mode": "acceptEdits",
         "effort": "high",

@@ -258,6 +258,40 @@ if ($stdout -match '"result"' -and $stdout -match '"protocolVersion"' -and $stdo
     Fail "Handshake failed -- see output above."
 }
 
+# 6b. Smoke-test: the registered hook command string, run through the host shell.
+# Reads `command` from hooks/hooks.json verbatim (only ${CLAUDE_PLUGIN_ROOT} substituted)
+# and runs it via cmd.exe /c (Windows) or /bin/sh -c (Linux) with a PreToolUse payload on
+# stdin, proving the extensionless command word resolves to the frozen binary.
+Write-Step "Smoke-testing the registered hook command (via the OS shell)"
+$hooksJson = Get-Content -Raw (Join-Path $root "hooks/hooks.json") | ConvertFrom-Json
+$hookCmd = $hooksJson.hooks.PreToolUse[0].hooks[0].command
+$hookCmd = $hookCmd.Replace('${CLAUDE_PLUGIN_ROOT}', $root)
+$hookData = Join-Path ([System.IO.Path]::GetTempPath()) ("harness-hook-smoke-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Force -Path $hookData | Out-Null
+$hookIn = [System.IO.Path]::GetTempFileName()
+$hookPayload = '{"session_id":"build-smoke","cwd":"x","permission_mode":"acceptEdits","hook_event_name":"PreToolUse"}'
+[System.IO.File]::WriteAllBytes($hookIn, [System.Text.Encoding]::UTF8.GetBytes($hookPayload))
+$prevData = $env:CLAUDE_PLUGIN_DATA
+$env:CLAUDE_PLUGIN_DATA = $hookData
+try {
+    if ($IsWindows) {
+        $hookOut = & cmd.exe /c "$hookCmd < `"$hookIn`"" 2>&1
+    } else {
+        $hookOut = & /bin/sh -c "$hookCmd < '$hookIn'" 2>&1
+    }
+} finally {
+    $env:CLAUDE_PLUGIN_DATA = $prevData
+}
+$hookFile = Join-Path $hookData "sessions/build-smoke.json"
+if ((Test-Path $hookFile) -and ((Get-Content -Raw $hookFile) -match 'acceptEdits')) {
+    Write-Host "    hook command wrote sessions/build-smoke.json OK" -ForegroundColor Green
+} else {
+    Write-Host "    command: $hookCmd" -ForegroundColor Yellow
+    Write-Host "    output: $hookOut" -ForegroundColor Yellow
+    Fail "Hook smoke failed -- the registered hook command did not produce a session file. Fallback: add a bin/harness.exe hook entry."
+}
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $hookData, $hookIn
+
 # 7. Optional: stage build/stage/agent-harness/ for the assembly step in
 # release.yml. NOTE: -Package on its own emits a *partial* stage tree
 # containing only the binary for this OS -- release.yml's assembly job merges
@@ -271,6 +305,10 @@ if ($Package) {
     Copy-Item -Recurse -Force "bin" $stage
     if (Test-Path "skills") {
         Copy-Item -Recurse -Force "skills" $stage
+    }
+    Copy-Item -Recurse -Force "hooks" $stage
+    if (-not (Test-Path (Join-Path $stage "hooks/hooks.json"))) {
+        Fail "hooks/hooks.json was not staged."
     }
     Copy-Item -Force "README.md" $stage -ErrorAction SilentlyContinue
     Copy-Item -Force "LICENSE" $stage -ErrorAction SilentlyContinue

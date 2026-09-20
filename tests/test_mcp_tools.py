@@ -411,6 +411,8 @@ def test_list_agents_uses_session_cwd_and_respects_disabled_plugins(
         json.dumps({"enabledPlugins": {"beta@mk": False}}), encoding="utf-8"
     )
 
+    (tmp_path / "elsewhere").mkdir()
+
     async def scenario(session):
         implicit = await _call(session, "harness_list_agents")
         explicit = await _call(session, "harness_list_agents", cwd=str(tmp_path / "elsewhere"))
@@ -424,4 +426,4 @@ def test_list_agents_uses_session_cwd_and_respects_disabled_plugins(
     assert by_name["alpha:helper"]["source_scope"] == "plugin"
     assert "beta:helper" not in by_name
     assert explicit[0] is False, explicit[1]
-    assert not os.path.samefile(explicit[2]["cwd"], session_context["cwd"])
+    assert os.path.samefile(explicit[2]["cwd"], tmp_path / "elsewhere")
