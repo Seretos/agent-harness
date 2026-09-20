@@ -360,6 +360,18 @@ def test_start_agent_refuses_context_without_permission_mode(
     assert not argv_log.exists()
 
 
+def test_start_agent_explicit_permission_mode_overrides_file_lacking_one(
+    server_params, tmp_path, project_dir, argv_log
+):
+    plant_session_file(tmp_path / "plugin-data", SESSION_ID, cwd=str(project_dir))
+    started, final = _start_and_finish(
+        server_params, agent="demo", cwd=str(project_dir), model="sonnet", permission_mode="plan"
+    )
+    assert final["state"] == "COMPLETED"
+    (record,) = _argv_records(argv_log)
+    assert _flag(record["argv"], "--permission-mode") == "plan"
+
+
 def test_list_agents_and_start_prompt_work_without_context(server_params_no_context, project_dir):
     async def scenario(session):
         listed = await _call(session, "harness_list_agents", cwd=str(project_dir))

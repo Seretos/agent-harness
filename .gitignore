@@ -20,3 +20,6 @@ dist/
 *.pyinstaller.tmp/
 .adev/
 .serena/
+
+# Committed MCP test-project settings (globally ignored otherwise)
+!mcp-test/.claude/settings.local.json

@@ -158,7 +158,10 @@ def harness_start_agent(
             "set or no matching session file exists in the sessions dir "
             f"({sessions_dir()}); refusing to start a child on unconfirmed rights"
         )
-    if not data.get("permission_mode"):
+    # Refusal rules: no session file at all (above) refuses unconditionally, even with an
+    # explicit permission_mode. A SessionStart-only snapshot refuses only when the EFFECTIVE
+    # mode (explicit argument, else file value) is missing. No cwd => cannot resolve the agent.
+    if not (permission_mode or data.get("permission_mode")):
         raise ToolError(
             "the parent session's context carries no permission_mode yet (only a "
             "SessionStart snapshot exists); refusing to start a child on unconfirmed rights"
