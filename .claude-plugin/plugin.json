@@ -4,6 +4,7 @@
   "version": "0.0.0",
   "author": { "name": "Arne von Appen" },
   "hooks": "./hooks/hooks.json",
+  "skills": "./skills",
   "mcpServers": {
     "harness": {
       "command": "${CLAUDE_PLUGIN_ROOT}/bin/harness",

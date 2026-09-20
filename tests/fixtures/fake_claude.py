@@ -6,7 +6,8 @@ carrying `result` and `session_id`). A prompt containing `SLEEP:<seconds>`
 keeps the process alive first, so one fixture yields both a fast run and a
 still-RUNNING run. With HARNESS_FAKE_ARGV_LOG set, each real invocation appends
 one JSON line {"argv": [...], "cwd": ...} so tests can assert which flags and
-working directory the CLI actually received.
+working directory the CLI actually received. A prompt containing `NO_RESULT`
+exits after the init event without any `result` event (a FAILED run).
 """
 import json
 import os
@@ -37,6 +38,10 @@ def main() -> int:
         deadline = time.monotonic() + float(match.group(1))
         while time.monotonic() < deadline:
             time.sleep(0.1)
+
+    if "NO_RESULT" in prompt:
+        # Ends without a terminal `result` event: the run finishes FAILED.
+        return 0
 
     print(
         json.dumps(

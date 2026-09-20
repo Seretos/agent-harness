@@ -45,3 +45,21 @@ pwsh -File scripts/build.ps1 -Clean -Package
 ```
 
 Output on Windows: `bin/harness.exe`. On Linux: `bin/harness`. Then install via `/plugin install <path>`.
+
+## Waiting for a long run: `harness wait-run`
+
+`harness_wait_run` cancels the run when its timeout expires. To wait for a run that outlasts a tool call, run the binary's second entry point from a background shell (see the `harness-wait` skill):
+
+```
+harness wait-run --run-id <id> --timeout <seconds> [--interval <seconds>]
+```
+
+It prints one `harness_poll_run`-shaped JSON object plus `waited_s` on stdout and never cancels the run. `--timeout` is required; `--interval` defaults to 2 (minimum 0.2).
+
+| exit code | meaning |
+| --------- | ------- |
+| 0 | run COMPLETED |
+| 1 | run FAILED |
+| 2 | `--timeout` elapsed; the run is still RUNNING |
+| 3 | run CANCELLED |
+| 4 | error: unknown run id, unreadable artifacts dir, or invalid arguments |
