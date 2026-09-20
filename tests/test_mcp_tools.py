@@ -2,6 +2,7 @@
 talking to the fake claude CLI from tests/fixtures/fake_claude.py."""
 import json
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 
@@ -76,8 +77,13 @@ def test_tools_list_exposes_harness_tools_and_no_ping(server_params):
         assert len((t.description or "").strip()) >= 20, f"{t.name} has no real description"
     wait_desc = next(t for t in tools if t.name == "harness_wait_run").description.lower()
     assert "cancel" in wait_desc, "wait description must warn that the deadline cancels the run"
-    assert "wait-run" in wait_desc, "wait description must name the wait-run command"
+    # Docs text IS the requirement here; make it a runnable-command-form check, not two loose tokens:
+    # one `wait-run ... --run-id ... --timeout` invocation, negation-free, next to the skill name.
+    assert re.search(r"wait-run[^.]*--run-id[^.]*--timeout|wait-run[^.]*--timeout[^.]*--run-id", wait_desc), (
+        "wait description must show the runnable `wait-run --run-id ... --timeout ...` form"
+    )
     assert "harness-wait" in wait_desc, "wait description must point at the harness-wait skill"
+    assert "do not use wait-run" not in wait_desc
 
 
 def test_list_agents_returns_project_agent(server_params, project_dir):

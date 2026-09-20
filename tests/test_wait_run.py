@@ -117,8 +117,27 @@ def test_malformed_flag_exits_four_not_two(wait_run_env, wait_run_cmd):
     assert out.strip() == ""
 
 
-def test_missing_timeout_exits_four(wait_run_env, wait_run_cmd):
-    proc = _spawn(wait_run_cmd, wait_run_env, "--run-id", "x")
-    code, out, _ = _finish(proc)
-    assert code == 4
+def test_missing_timeout_exits_four_even_for_a_live_run(server_params, wait_run_env, wait_run_cmd):
+    """--timeout is REQUIRED. The run id is real and RUNNING, so an implementation that
+    defaulted --timeout would block polling (subprocess timeout below) instead of exiting 4."""
+
+    def _finish_bounded(proc):
+        try:
+            out, err = proc.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+            return "blocked", out, err
+        return proc.returncode, out, err
+
+    async def scenario(session):
+        run_id = await _start(session, "SLEEP:30")
+        proc = _spawn(wait_run_cmd, wait_run_env, "--run-id", run_id)
+        result = await anyio.to_thread.run_sync(_finish_bounded, proc)
+        await _call(session, "harness_stop_run", run_id=run_id)
+        return result
+
+    code, out, err = _run(scenario, server_params)
+    assert code == 4, (code, out, err)
     assert out.strip() == ""
+    assert "--timeout" in err, "usage error must name the missing --timeout flag"
