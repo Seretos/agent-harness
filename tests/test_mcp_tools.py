@@ -2,8 +2,10 @@
 talking to the fake claude CLI from tests/fixtures/fake_claude.py."""
 import json
 import os
+import re
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import anyio
 import pytest
@@ -78,12 +80,24 @@ def test_tools_list_exposes_harness_tools_and_no_ping(server_params):
     wait_desc = next(t for t in tools if t.name == "harness_wait_run").description.lower()
     assert "cancel" in wait_desc, "wait description must warn that the deadline cancels the run"
     desc = {t.name: (t.description or "").lower() for t in tools}
-    assert "run_id" in desc["harness_list_runs"], "list description must explain lost-run_id recovery"
-    assert "lost" in desc["harness_list_runs"]
-    assert "event_count" in desc["harness_poll_run"]
-    assert "last_event_at" in desc["harness_poll_run"]
-    assert "label" in desc["harness_start_agent"]
-    assert "label" in desc["harness_start_prompt"]
+    # Phrase-level checks: the wording must explain the purpose / semantics, not just
+    # mention a token.
+    list_desc = desc["harness_list_runs"]
+    assert re.search(r"(lost|forgot\w*|no longer (have|know))\W+(\w+\W+){0,3}run_id", list_desc), (
+        "list description must explain recovering a lost run_id"
+    )
+    assert re.search(r"harness_(stop|poll|wait|cleanup)_run", list_desc), (
+        "list description must say which tools the recovered run_id feeds"
+    )
+    poll_desc = desc["harness_poll_run"]
+    assert re.search(r"event_count[^.]*last_event_at|last_event_at[^.]*event_count", poll_desc)
+    assert re.search(r"(only|just)\W+(\w+\W+){0,4}(advance|grow|increase|change)", poll_desc) and (
+        "running" in poll_desc
+    ), "poll description must say the progress fields only advance while RUNNING"
+    for name in ("harness_start_agent", "harness_start_prompt"):
+        assert re.search(r"label[^.]*harness_list_runs|harness_list_runs[^.]*label", desc[name]), (
+            f"{name} description must say the label shows up in harness_list_runs"
+        )
 
 
 def test_list_agents_returns_project_agent(server_params, project_dir):
@@ -292,7 +306,9 @@ def test_list_runs_lists_runs_same_server_and_after_restart(server_params, proje
         listed = await _call(session, "harness_list_runs")
         return agent["run_id"], prompt["run_id"], sleeper["run_id"], listed
 
+    t_start = time.time()
     agent_id, prompt_id, sleeper_id, same = _run(session1, server_params)
+    t_end = time.time()
 
     async def session2(session):
         listed = await _call(session, "harness_list_runs")
@@ -307,7 +323,6 @@ def test_list_runs_lists_runs_same_server_and_after_restart(server_params, proje
         assert {agent_id, prompt_id, sleeper_id} <= set(rows)
         for row in rows.values():
             assert set(row) == LIST_ROW_KEYS, row
-            assert "text" not in row and "usage" not in row
         assert rows[agent_id]["label"] == "agent-a"
         assert rows[prompt_id]["label"] == "prompt-b"
         assert rows[sleeper_id]["label"] == "sleeper-c"
@@ -315,9 +330,11 @@ def test_list_runs_lists_runs_same_server_and_after_restart(server_params, proje
         assert rows[prompt_id]["state"] == "COMPLETED"
         assert rows[sleeper_id]["state"] == "RUNNING"
         for row in rows.values():
-            assert row["model"]
-            assert row["cwd"]
-            assert isinstance(row["created_at"], (int, float))
+            assert row["model"] == "sonnet"
+            assert isinstance(row["cwd"], str) and row["cwd"]
+            assert isinstance(row["created_at"], float)
+            assert t_start - 1 <= row["created_at"] <= t_end + 1, row["created_at"]
+        assert Path(rows[agent_id]["cwd"]).resolve() == Path(project_dir).resolve()
 
 
 def test_list_runs_drops_cleaned_up_run(server_params):
@@ -352,7 +369,8 @@ def test_poll_reports_growing_progress_while_running(server_params):
     a, b = first[2], second[2]
     assert a["state"] == "RUNNING" and b["state"] == "RUNNING"
     assert b["event_count"] > a["event_count"]
-    assert b["last_event_at"] >= a["last_event_at"]
+    assert isinstance(a["last_event_at"], float) and isinstance(b["last_event_at"], float)
+    assert b["last_event_at"] > a["last_event_at"]
 
 
 # --- parent-session HostContext wiring (#1) ---------------------------------------
