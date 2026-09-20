@@ -16,6 +16,7 @@ EXPECTED_TOOLS = {
     "harness_start_agent",
     "harness_start_prompt",
     "harness_poll_run",
+    "harness_list_runs",
     "harness_wait_run",
     "harness_stop_run",
     "harness_cleanup_run",
@@ -76,6 +77,13 @@ def test_tools_list_exposes_harness_tools_and_no_ping(server_params):
         assert len((t.description or "").strip()) >= 20, f"{t.name} has no real description"
     wait_desc = next(t for t in tools if t.name == "harness_wait_run").description.lower()
     assert "cancel" in wait_desc, "wait description must warn that the deadline cancels the run"
+    desc = {t.name: (t.description or "").lower() for t in tools}
+    assert "run_id" in desc["harness_list_runs"], "list description must explain lost-run_id recovery"
+    assert "lost" in desc["harness_list_runs"]
+    assert "event_count" in desc["harness_poll_run"]
+    assert "last_event_at" in desc["harness_poll_run"]
+    assert "label" in desc["harness_start_agent"]
+    assert "label" in desc["harness_start_prompt"]
 
 
 def test_list_agents_returns_project_agent(server_params, project_dir):
@@ -253,6 +261,98 @@ def test_wait_run_does_not_block_other_tool_calls(server_params, project_dir):
     assert listed[0] is False, listed[1]
     assert still_waiting, "list_agents only returned after the wait finished"
     assert waited[2]["state"] == "CANCELLED"
+
+
+# --- harness_list_runs + progress fields (#6) -------------------------------------
+
+LIST_ROW_KEYS = {"run_id", "state", "model", "cwd", "created_at", "label"}
+
+
+def test_list_runs_lists_runs_same_server_and_after_restart(server_params, project_dir):
+    async def session1(session):
+        e1, t1, agent = await _call(
+            session,
+            "harness_start_agent",
+            agent="demo",
+            cwd=str(project_dir),
+            model="sonnet",
+            label="agent-a",
+        )
+        assert not e1, t1
+        e2, t2, prompt = await _call(
+            session, "harness_start_prompt", prompt="Say OK.", model="sonnet", label="prompt-b"
+        )
+        assert not e2, t2
+        e3, t3, sleeper = await _call(
+            session, "harness_start_prompt", prompt="SLEEP:30", model="sonnet", label="sleeper-c"
+        )
+        assert not e3, t3
+        await _poll_until_terminal(session, agent["run_id"])
+        await _poll_until_terminal(session, prompt["run_id"])
+        listed = await _call(session, "harness_list_runs")
+        return agent["run_id"], prompt["run_id"], sleeper["run_id"], listed
+
+    agent_id, prompt_id, sleeper_id, same = _run(session1, server_params)
+
+    async def session2(session):
+        listed = await _call(session, "harness_list_runs")
+        await _call(session, "harness_stop_run", run_id=sleeper_id)
+        return listed
+
+    restarted = _run(session2, server_params)
+
+    for is_error, text, payload in (same, restarted):
+        assert not is_error, text
+        rows = {r["run_id"]: r for r in payload["runs"]}
+        assert {agent_id, prompt_id, sleeper_id} <= set(rows)
+        for row in rows.values():
+            assert set(row) == LIST_ROW_KEYS, row
+            assert "text" not in row and "usage" not in row
+        assert rows[agent_id]["label"] == "agent-a"
+        assert rows[prompt_id]["label"] == "prompt-b"
+        assert rows[sleeper_id]["label"] == "sleeper-c"
+        assert rows[agent_id]["state"] == "COMPLETED"
+        assert rows[prompt_id]["state"] == "COMPLETED"
+        assert rows[sleeper_id]["state"] == "RUNNING"
+        for row in rows.values():
+            assert row["model"]
+            assert row["cwd"]
+            assert isinstance(row["created_at"], (int, float))
+
+
+def test_list_runs_drops_cleaned_up_run(server_params):
+    async def scenario(session):
+        _, _, started = await _call(session, "harness_start_prompt", prompt="Say OK.", model="sonnet")
+        await _poll_until_terminal(session, started["run_id"])
+        await _call(session, "harness_cleanup_run", run_id=started["run_id"])
+        return started["run_id"], await _call(session, "harness_list_runs")
+
+    run_id, (is_error, text, payload) = _run(scenario, server_params)
+    assert not is_error, text
+    assert run_id not in {r["run_id"] for r in payload["runs"]}
+
+
+def test_poll_reports_growing_progress_while_running(server_params):
+    async def scenario(session):
+        is_error, text, started = await _call(
+            session, "harness_start_prompt", prompt="TICK:8:0.4", model="sonnet"
+        )
+        assert not is_error, text
+        run_id = started["run_id"]
+        await anyio.sleep(0.6)
+        first = await _call(session, "harness_poll_run", run_id=run_id)
+        await anyio.sleep(1.0)
+        second = await _call(session, "harness_poll_run", run_id=run_id)
+        await _call(session, "harness_stop_run", run_id=run_id)
+        return first, second
+
+    first, second = _run(scenario, server_params)
+    assert first[0] is False, first[1]
+    assert second[0] is False, second[1]
+    a, b = first[2], second[2]
+    assert a["state"] == "RUNNING" and b["state"] == "RUNNING"
+    assert b["event_count"] > a["event_count"]
+    assert b["last_event_at"] >= a["last_event_at"]
 
 
 # --- parent-session HostContext wiring (#1) ---------------------------------------

@@ -8,6 +8,9 @@ still-RUNNING run. With HARNESS_FAKE_ARGV_LOG set, each real invocation appends
 one JSON line {"argv": [...], "cwd": ...} so tests can assert which flags and
 working directory the CLI actually received. A prompt containing `NO_RESULT`
 exits after the init event without any `result` event (a FAILED run).
+A prompt containing `TICK:<count>:<interval>` emits `count` assistant events
+`interval` seconds apart (flushed) before the terminal `result` event, so a
+still-RUNNING run makes visible progress.
 """
 import json
 import os
@@ -38,6 +41,24 @@ def main() -> int:
         deadline = time.monotonic() + float(match.group(1))
         while time.monotonic() < deadline:
             time.sleep(0.1)
+
+    tick = re.search(r"TICK:(\d+):(\d+(?:\.\d+)?)", prompt)
+    if tick:
+        for i in range(int(tick.group(1))):
+            print(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": f"tick {i}"}],
+                        },
+                        "session_id": session_id,
+                    }
+                ),
+                flush=True,
+            )
+            time.sleep(float(tick.group(2)))
 
     if "NO_RESULT" in prompt:
         # Ends without a terminal `result` event: the run finishes FAILED.
