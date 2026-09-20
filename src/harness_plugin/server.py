@@ -194,6 +194,20 @@ def harness_list_runs() -> dict[str, Any]:
 
 @mcp.tool()
 @_tool_errors
+def harness_send_message(run_id: str, prompt: str) -> dict[str, Any]:
+    """Send a follow-up `prompt` to a run that has already finished (only finished runs;
+    a RUNNING run is refused) and return immediately. It resumes the origin run's session
+    and returns a new run: a new `run_id` (with `resumed_from` naming the origin run_id) in
+    state RUNNING. The origin run's isolation is preserved: the follow-up runs with the same
+    clean/agent flags and cwd as the origin. Afterwards use harness_wait_run or
+    harness_poll_run on the new run_id to get the reply."""
+    if not prompt.strip():
+        raise HarnessError("prompt must not be empty")
+    return run_to_dict(harness().start_resume(run_id, prompt), resumed_from=run_id)
+
+
+@mcp.tool()
+@_tool_errors
 async def harness_wait_run(run_id: str, timeout_seconds: float = 300.0) -> dict[str, Any]:
     """Block until the run finishes and return its result. WARNING: if `timeout_seconds`
     (default 300) expires first, the deadline cancels the run (terminal state CANCELLED)
