@@ -3,18 +3,13 @@ from __future__ import annotations
 
 import functools
 import inspect
-import json
 import os
 import sys
-from enum import Enum
 from functools import partial
-from pathlib import Path
 from typing import Any
 
 import anyio.to_thread
 from lib_python_harness import (
-    FileRunStore,
-    Harness,
     HarnessError,
     HostContext,
     Isolation,
@@ -31,31 +26,9 @@ from harness_plugin.host_context import (
     probe_warning,
     sessions_dir,
 )
+from harness_plugin.runs import artifacts_root, harness, run_to_dict
 
 mcp = FastMCP("harness")
-
-_HARNESS: Harness | None = None
-
-
-def _artifacts_root() -> Path:
-    override = os.environ.get("HARNESS_ARTIFACTS_DIR")
-    root = Path(override) if override else Path.home() / ".agent-harness" / "runs"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
-
-
-def _claude_argv() -> list[str]:
-    raw = os.environ.get("HARNESS_CLAUDE_ARGV")
-    return [str(a) for a in json.loads(raw)] if raw else ["claude"]
-
-
-def _harness() -> Harness:
-    """Lazy singleton: poll/wait/stop depend on the in-process Popen map."""
-    global _HARNESS
-    if _HARNESS is None:
-        _HARNESS = Harness(store=FileRunStore(_artifacts_root()), claude_argv=_claude_argv())
-    return _HARNESS
-
 
 def _tool_errors(fn):
     """Re-raise lib errors as ToolError carrying the exception class name."""
@@ -78,32 +51,6 @@ def _tool_errors(fn):
                 raise ToolError(f"{type(exc).__name__}: {exc}") from exc
 
     return wrapper
-
-
-def _jsonable(value: Any) -> Any:
-    if isinstance(value, Enum):
-        return value.name
-    if isinstance(value, Path):
-        return str(value)
-    return value
-
-
-def _run_to_dict(result: Any, **extra: Any) -> dict[str, Any]:
-    out = {
-        "run_id": result.run_id,
-        "session_id": result.session_id,
-        "state": _jsonable(result.state),
-        "text": result.text,
-        "is_error": result.is_error,
-        "subtype": result.subtype,
-        "structured_output": result.structured_output,
-        "usage": result.usage,
-        "cost": result.cost,
-        "transcript_path": _jsonable(result.transcript_path),
-        "duration_s": result.duration_s,
-    }
-    out.update(extra)
-    return out
 
 
 @mcp.tool()
@@ -185,9 +132,9 @@ def harness_start_agent(
             f"no model for agent {agent!r}: pass `model` or set `model:` in its definition"
         )
     spec.cwd = used
-    spec.artifacts_dir = _artifacts_root()
-    return _run_to_dict(
-        _harness().start(spec),
+    spec.artifacts_dir = artifacts_root()
+    return run_to_dict(
+        harness().start(spec),
         cwd=used,
         context_source=source,
         permission_mode=ctx.permission_mode,
@@ -214,16 +161,16 @@ def harness_start_prompt(
         effort=effort,
         system_prompt=system_prompt,
         cwd=cwd,
-        artifacts_dir=_artifacts_root(),
+        artifacts_dir=artifacts_root(),
     )
-    return _run_to_dict(_harness().start(spec))
+    return run_to_dict(harness().start(spec))
 
 
 @mcp.tool()
 @_tool_errors
 def harness_poll_run(run_id: str) -> dict[str, Any]:
     """Return the current state (and result, once finished) of a run without blocking."""
-    return _run_to_dict(_harness().poll(run_id))
+    return run_to_dict(harness().poll(run_id))
 
 
 @mcp.tool()
@@ -231,23 +178,26 @@ def harness_poll_run(run_id: str) -> dict[str, Any]:
 async def harness_wait_run(run_id: str, timeout_seconds: float = 300.0) -> dict[str, Any]:
     """Block until the run finishes and return its result. WARNING: if `timeout_seconds`
     (default 300) expires first, the deadline cancels the run (terminal state CANCELLED)
-    rather than just giving up waiting; use harness_poll_run to check without cancelling."""
-    result = await anyio.to_thread.run_sync(partial(_harness().wait, run_id, timeout_seconds))
-    return _run_to_dict(result)
+    rather than just giving up waiting; use harness_poll_run to check without cancelling.
+    For a run that may outlast a tool call, do not block here: run the shell command
+    `harness wait-run --run-id <id> --timeout <s>` in the background instead (see the
+    `harness-wait` skill); its timeout never cancels the run."""
+    result = await anyio.to_thread.run_sync(partial(harness().wait, run_id, timeout_seconds))
+    return run_to_dict(result)
 
 
 @mcp.tool()
 @_tool_errors
 def harness_stop_run(run_id: str) -> dict[str, Any]:
     """Stop a RUNNING run (terminal state CANCELLED). Errors on an already finished run."""
-    return _run_to_dict(_harness().stop(run_id))
+    return run_to_dict(harness().stop(run_id))
 
 
 @mcp.tool()
 @_tool_errors
 def harness_cleanup_run(run_id: str) -> dict[str, Any]:
     """Forget a run's record. Artifacts on disk are kept; the run cannot be polled afterwards."""
-    _harness().cleanup(run_id)
+    harness().cleanup(run_id)
     return {"run_id": run_id, "cleaned": True}
 
 

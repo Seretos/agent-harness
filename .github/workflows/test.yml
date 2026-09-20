@@ -68,3 +68,11 @@ jobs:
       - name: Build and smoke-test the binary
         shell: pwsh
         run: pwsh -File scripts/build.ps1
+
+      - name: Run the wait-run tests against the frozen binary
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[test]"
+          $bin = if ($IsWindows) { "bin/harness.exe" } else { "bin/harness" }
+          $env:HARNESS_BIN = (Resolve-Path $bin).Path
+          python -m pytest tests/test_wait_run.py
