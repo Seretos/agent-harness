@@ -52,7 +52,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-22.04]
+        # include: form (not os: [...] + extra include) so the 5.1 row is its
+        # own job instead of being merged into the windows-latest combination.
+        # `launcher` is the PowerShell host that runs build.ps1: powershell.exe
+        # is Windows PowerShell 5.1, pwsh is PowerShell 7 / Linux pwsh.
+        include:
+          - os: windows-latest
+            launcher: pwsh
+          - os: windows-latest
+            launcher: powershell.exe
+          - os: ubuntu-22.04
+            launcher: pwsh
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
 
@@ -67,7 +77,7 @@ jobs:
 
       - name: Build and smoke-test the binary
         shell: pwsh
-        run: pwsh -File scripts/build.ps1
+        run: ${{ matrix.launcher }} -File scripts/build.ps1
 
       - name: Run the wait-run tests against the frozen binary
         shell: pwsh
