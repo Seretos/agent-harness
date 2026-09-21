@@ -107,7 +107,7 @@ def project_dir(tmp_path) -> Path:
 
 @pytest.fixture
 def wait_run_env(tmp_path) -> dict[str, str]:
-    """Environment for a `wait-run` child: the same HARNESS_ARTIFACTS_DIR /
+    """Environment for a `wait` child: the same HARNESS_ARTIFACTS_DIR /
     HARNESS_CLAUDE_ARGV the `server_params` server uses, layered over os.environ
     so Windows keeps SYSTEMROOT/PATH."""
     return {**os.environ, **_base_env(tmp_path)}
@@ -115,8 +115,8 @@ def wait_run_env(tmp_path) -> dict[str, str]:
 
 @pytest.fixture
 def wait_run_cmd() -> list[str]:
-    """argv prefix that launches the `wait-run` subcommand: a prebuilt binary when
+    """argv prefix that launches the `wait` subcommand: a prebuilt binary when
     HARNESS_BIN points at one, else `python -m harness_plugin`."""
     binary = os.environ.get("HARNESS_BIN")
     base = [binary] if binary else [sys.executable, "-m", "harness_plugin"]
-    return [*base, "wait-run"]
+    return [*base, "wait"]
