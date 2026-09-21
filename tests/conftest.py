@@ -73,6 +73,20 @@ def server_params(tmp_path, session_context) -> StdioServerParameters:
 
 
 @pytest.fixture
+def live_server_params(tmp_path, session_context) -> StdioServerParameters:
+    """Like `server_params` but talking to the real `claude` CLI (no HARNESS_CLAUDE_ARGV).
+    PATH is inherited so the real binary resolves."""
+    env = _base_env(tmp_path)
+    del env["HARNESS_CLAUDE_ARGV"]
+    env["CLAUDE_CODE_SESSION_ID"] = SESSION_ID
+    # Real claude needs the user's credentials: keep the real config dir/home.
+    for key in ("CLAUDE_CONFIG_DIR", "HOME", "USERPROFILE"):
+        env.pop(key, None)
+    env = {**os.environ, **env}
+    return _params(env)
+
+
+@pytest.fixture
 def server_params_no_context(tmp_path) -> StdioServerParameters:
     """Same server, but no session id, no project dir and an empty sessions dir:
     no context can be resolved."""

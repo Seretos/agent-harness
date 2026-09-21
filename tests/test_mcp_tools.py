@@ -109,6 +109,18 @@ def test_tools_list_exposes_harness_tools_and_no_ping(server_params):
     assert "harness_wait_run" in send_desc and "harness_poll_run" in send_desc, (
         "send_message description must point to harness_wait_run / harness_poll_run"
     )
+    start_agent = next(t for t in tools if t.name == "harness_start_agent")
+    assert "prompt" in start_agent.inputSchema["properties"], (
+        "harness_start_agent must expose an optional `prompt` argument"
+    )
+    assert "prompt" not in start_agent.inputSchema.get("required", [])
+    start_agent_desc = desc["harness_start_agent"]
+    assert re.search(r"prompt[^.]*(task|user message)", start_agent_desc), (
+        "start_agent description must say `prompt` is the run's task / user message"
+    )
+    assert re.search(r"(body|definition)[^.]*system prompt", start_agent_desc), (
+        "start_agent description must say the definition body stays the system prompt"
+    )
     for name in ("harness_start_agent", "harness_start_prompt"):
         assert re.search(r"label[^.]*harness_list_runs|harness_list_runs[^.]*label", desc[name]), (
             f"{name} description must say the label shows up in harness_list_runs"
@@ -630,3 +642,51 @@ def test_send_message_error_paths(server_params, argv_log):
     assert cleaned[0] is True
     assert "HarnessError" in cleaned[1]
     assert alive[0] is False, alive[1]
+
+
+def _agents_payload(record):
+    return json.loads(_flag(record["argv"], "--agents"))
+
+
+def test_start_agent_prompt_becomes_user_message_and_body_stays_agent_prompt(
+    server_params, project_dir, argv_log
+):
+    started, final = _start_and_finish(
+        server_params, agent="demo", cwd=str(project_dir), model="sonnet", prompt="ECHO:CBA"
+    )
+    assert final["state"] == "COMPLETED"
+    # The fake CLI answers from stdin: the definition body ("Say OK.") has no ECHO marker,
+    # so "CBA" proves the prompt reached the run as its user message.
+    assert final["text"] == "CBA"
+    (record,) = _argv_records(argv_log)
+    agent_prompt = _agents_payload(record)["demo"]["prompt"]
+    assert "Say OK." in agent_prompt, "the definition body must stay the agent's system prompt"
+    assert "ECHO" not in agent_prompt, "the task must not leak into the agent's system prompt"
+    assert _flag(record["argv"], "--agent") == "demo"
+
+
+def test_start_agent_without_prompt_keeps_body_as_user_message(
+    server_params, project_dir, argv_log
+):
+    _, final = _start_and_finish(
+        server_params, agent="demo", cwd=str(project_dir), model="sonnet"
+    )
+    assert final["text"] == "OK"
+    (record,) = _argv_records(argv_log)
+    assert "Say OK." in _agents_payload(record)["demo"]["prompt"]
+
+
+@pytest.mark.parametrize("blank", ["", "   \n\t"], ids=["empty", "whitespace"])
+def test_start_agent_refuses_blank_prompt_without_spawning(
+    server_params, project_dir, argv_log, blank
+):
+    async def scenario(session):
+        return await _call(
+            session, "harness_start_agent", agent="demo", cwd=str(project_dir),
+            model="sonnet", prompt=blank,
+        )
+
+    is_error, text, _ = _run(scenario, server_params)
+    assert is_error
+    assert "empty" in text.lower()
+    assert not argv_log.exists() or not _argv_records(argv_log)
