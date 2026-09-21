@@ -14,6 +14,7 @@ from lib_python_harness import (
     HostContext,
     Isolation,
     RunSpec,
+    RunState,
     discover,
     resolve,
 )
@@ -215,7 +216,16 @@ async def harness_wait_run(run_id: str, timeout_seconds: float = 300.0) -> dict[
     For a run that may outlast a tool call, do not block here: run the shell command
     `harness wait-run --run-id <id> --timeout <s>` in the background instead (see the
     `harness-wait` skill); its timeout never cancels the run."""
-    result = await anyio.to_thread.run_sync(partial(harness().wait, run_id, timeout_seconds))
+    h = harness()
+    result = await anyio.to_thread.run_sync(partial(h.wait, run_id, timeout_seconds))
+    if result.state == RunState.RUNNING:
+        # lib-python-harness >= v0.0.4: an expired wait deadline only ends the waiting and
+        # returns the still-RUNNING result. This tool's documented contract is that the
+        # deadline cancels the run, so do it explicitly.
+        try:
+            result = await anyio.to_thread.run_sync(h.stop, run_id)
+        except HarnessError:  # finished on its own between the wait and the stop
+            result = await anyio.to_thread.run_sync(partial(h.wait, run_id, 0.0))
     return run_to_dict(result)
 
 

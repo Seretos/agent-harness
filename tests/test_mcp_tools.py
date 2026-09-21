@@ -346,7 +346,8 @@ def test_list_runs_lists_runs_same_server_and_after_restart(server_params, proje
         if sys.platform == "win32":
             # Ending the stdio session kills the server's process tree, including the
             # detached fake-claude child, so after a restart the orphan may be reconciled
-            # to FAILED (same limitation as the skipped wait-run cancel test).
+            # to FAILED (re-verified on lib-python-harness v0.0.4: still fails 5/5 without
+            # this allowance; same limitation as the skipped wait-run cancel test).
             assert rows[sleeper_id]["state"] in {"RUNNING", "FAILED"}
         else:
             assert rows[sleeper_id]["state"] == "RUNNING"
