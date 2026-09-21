@@ -73,6 +73,20 @@ def server_params(tmp_path, session_context) -> StdioServerParameters:
 
 
 @pytest.fixture
+def live_server_params(tmp_path, session_context) -> StdioServerParameters:
+    """Like `server_params` but talking to the real `claude` CLI (no HARNESS_CLAUDE_ARGV).
+    PATH is inherited so the real binary resolves."""
+    env = _base_env(tmp_path)
+    del env["HARNESS_CLAUDE_ARGV"]
+    env["CLAUDE_CODE_SESSION_ID"] = SESSION_ID
+    # Real claude needs the user's credentials: keep the real config dir/home.
+    for key in ("CLAUDE_CONFIG_DIR", "HOME", "USERPROFILE"):
+        env.pop(key, None)
+    env = {**os.environ, **env}
+    return _params(env)
+
+
+@pytest.fixture
 def server_params_no_context(tmp_path) -> StdioServerParameters:
     """Same server, but no session id, no project dir and an empty sessions dir:
     no context can be resolved."""
@@ -93,7 +107,7 @@ def project_dir(tmp_path) -> Path:
 
 @pytest.fixture
 def wait_run_env(tmp_path) -> dict[str, str]:
-    """Environment for a `wait-run` child: the same HARNESS_ARTIFACTS_DIR /
+    """Environment for a `wait` child: the same HARNESS_ARTIFACTS_DIR /
     HARNESS_CLAUDE_ARGV the `server_params` server uses, layered over os.environ
     so Windows keeps SYSTEMROOT/PATH."""
     return {**os.environ, **_base_env(tmp_path)}
@@ -101,8 +115,8 @@ def wait_run_env(tmp_path) -> dict[str, str]:
 
 @pytest.fixture
 def wait_run_cmd() -> list[str]:
-    """argv prefix that launches the `wait-run` subcommand: a prebuilt binary when
+    """argv prefix that launches the `wait` subcommand: a prebuilt binary when
     HARNESS_BIN points at one, else `python -m harness_plugin`."""
     binary = os.environ.get("HARNESS_BIN")
     base = [binary] if binary else [sys.executable, "-m", "harness_plugin"]
-    return [*base, "wait-run"]
+    return [*base, "wait"]

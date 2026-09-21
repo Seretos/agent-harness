@@ -1,4 +1,4 @@
-"""The `wait-run` subcommand, run as a real second process against runs that a real
+"""The `wait` subcommand, run as a real second process against runs that a real
 `python -m harness_plugin` MCP server (a different process) started.
 
 Exit codes: 0 COMPLETED, 1 FAILED, 2 wait timeout (run left alone), 3 CANCELLED,
@@ -58,7 +58,7 @@ def test_wait_run_blocks_until_completed_and_exits_zero(server_params, wait_run_
     async def scenario(session):
         # No harness_poll_run between start and the CLI's exit: the CLI must be what sees the end.
         run_id = await _start(session, "SLEEP:3")
-        proc = _spawn(wait_run_cmd, wait_run_env, "--run-id", run_id, "--timeout", "60")
+        proc = _spawn(wait_run_cmd, wait_run_env, run_id, "--timeout", "60")
         return await anyio.to_thread.run_sync(_finish, proc)
 
     code, out, err = _run(scenario, server_params)
@@ -74,7 +74,7 @@ def test_timeout_exits_two_and_leaves_run_running(server_params, wait_run_env, w
     async def scenario(session):
         run_id = await _start(session, "SLEEP:30")
         proc = _spawn(
-            wait_run_cmd, wait_run_env, "--run-id", run_id, "--timeout", "2", "--interval", "0.5"
+            wait_run_cmd, wait_run_env, run_id, "--timeout", "2", "--interval", "0.5"
         )
         result = await anyio.to_thread.run_sync(_finish, proc)
         polled = await _call(session, "harness_poll_run", run_id=run_id)
@@ -93,7 +93,7 @@ def test_timeout_exits_two_and_leaves_run_running(server_params, wait_run_env, w
 def test_failed_run_exits_one(server_params, wait_run_env, wait_run_cmd):
     async def scenario(session):
         run_id = await _start(session, "NO_RESULT")
-        proc = _spawn(wait_run_cmd, wait_run_env, "--run-id", run_id, "--timeout", "60")
+        proc = _spawn(wait_run_cmd, wait_run_env, run_id, "--timeout", "60")
         return await anyio.to_thread.run_sync(_finish, proc)
 
     code, out, err = _run(scenario, server_params)
@@ -105,16 +105,16 @@ def test_failed_run_exits_one(server_params, wait_run_env, wait_run_cmd):
 @pytest.mark.skipif(
     sys.platform == "win32",
     reason=(
-        "lib-python-harness v0.0.3: Harness.stop() inside the stdio MCP server blocks ~15 s on "
-        "Windows (_cli_version pipes never see EOF), so wait_for finalises FAILED (3 s grace) "
-        "before CANCELLED is written; exit 3 is covered on Linux"
+        "lib-python-harness v0.0.4 (re-verified, still failing 5/5 on Windows): Harness.stop() "
+        "inside the stdio MCP server does not win the race on Windows, so wait_for "
+        "finalises the run FAILED before CANCELLED is written; exit 3 is covered on Linux"
     ),
 )
 def test_cancelled_run_exits_three(server_params, wait_run_env, wait_run_cmd):
     async def scenario(session):
         run_id = await _start(session, "SLEEP:30")
         proc = _spawn(
-            wait_run_cmd, wait_run_env, "--run-id", run_id, "--timeout", "60", "--interval", "0.5"
+            wait_run_cmd, wait_run_env, run_id, "--timeout", "60", "--interval", "0.5"
         )
         await anyio.sleep(2)
         is_error, text, _ = await _call(session, "harness_stop_run", run_id=run_id)
@@ -127,28 +127,12 @@ def test_cancelled_run_exits_three(server_params, wait_run_env, wait_run_cmd):
 
 
 def test_unknown_run_id_exits_four(wait_run_env, wait_run_cmd):
-    proc = _spawn(wait_run_cmd, wait_run_env, "--run-id", "no-such-run", "--timeout", "5")
-    code, out, err = _finish(proc)
+    # Bare positional form, no --timeout: must fail fast, not wait indefinitely.
+    proc = _spawn(wait_run_cmd, wait_run_env, "no-such-run")
+    code, out, err = _finish_bounded(proc)
     assert code == 4, (out, err)
     assert out.strip() == ""
     assert "no-such-run" in err
-
-
-def test_missing_timeout_exits_four_even_for_a_live_run(server_params, wait_run_env, wait_run_cmd):
-    """--timeout is REQUIRED. The run id is real and RUNNING, so an implementation that
-    defaulted --timeout would block polling (subprocess timeout below) instead of exiting 4."""
-
-    async def scenario(session):
-        run_id = await _start(session, "SLEEP:30")
-        proc = _spawn(wait_run_cmd, wait_run_env, "--run-id", run_id)
-        result = await anyio.to_thread.run_sync(_finish_bounded, proc)
-        await _call(session, "harness_stop_run", run_id=run_id)
-        return result
-
-    code, out, err = _run(scenario, server_params)
-    assert code == 4, (code, out, err)
-    assert out.strip() == ""
-    assert "--timeout" in err, "usage error must name the missing --timeout flag"
 
 
 def test_malformed_flag_exits_four_not_two(server_params, wait_run_env, wait_run_cmd):
@@ -157,7 +141,7 @@ def test_malformed_flag_exits_four_not_two(server_params, wait_run_env, wait_run
 
     async def scenario(session):
         run_id = await _start(session, "SLEEP:30")
-        proc = _spawn(wait_run_cmd, wait_run_env, "--run-id", run_id, "--timeout", "5", "--bogus")
+        proc = _spawn(wait_run_cmd, wait_run_env, run_id, "--timeout", "5", "--bogus")
         result = await anyio.to_thread.run_sync(_finish_bounded, proc)
         await _call(session, "harness_stop_run", run_id=run_id)
         return result
@@ -166,3 +150,32 @@ def test_malformed_flag_exits_four_not_two(server_params, wait_run_env, wait_run
     assert code == 4, (code, out, err)
     assert out.strip() == ""
     assert "--bogus" in err, "usage error must name the unrecognised flag"
+
+
+def test_wait_without_timeout_blocks_until_completed(server_params, wait_run_env, wait_run_cmd):
+    async def scenario(session):
+        run_id = await _start(session, "SLEEP:3")
+        proc = _spawn(wait_run_cmd, wait_run_env, run_id)
+        return await anyio.to_thread.run_sync(_finish, proc)
+
+    code, out, err = _run(scenario, server_params)
+    assert code == 0, (out, err)
+    payload = _one_json(out)
+    assert payload["state"] == "COMPLETED"
+    assert payload["waited_s"] >= 2.5
+
+
+def test_two_parallel_waits_do_not_interfere(server_params, wait_run_env, wait_run_cmd):
+    async def scenario(session):
+        first = await _start(session, "SLEEP:3 ECHO:alpha")
+        second = await _start(session, "SLEEP:3 ECHO:bravo")
+        procs = [_spawn(wait_run_cmd, wait_run_env, rid) for rid in (first, second)]
+        results = [await anyio.to_thread.run_sync(_finish, p) for p in procs]
+        return (first, second), results
+
+    (first, second), results = _run(scenario, server_params)
+    for (code, out, err), rid, word in zip(results, (first, second), ("alpha", "bravo")):
+        assert code == 0, (out, err)
+        payload = _one_json(out)
+        assert payload["run_id"] == rid
+        assert payload["text"] == word

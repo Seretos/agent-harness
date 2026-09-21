@@ -10,7 +10,7 @@ requires-python = ">=3.11"
 authors = [{ name = "Arne von Appen" }]
 dependencies = [
   "mcp>=1.2,<2",
-  "lib-python-harness @ git+https://github.com/Seretos/lib-python-harness@v0.0.3",
+  "lib-python-harness @ git+https://github.com/Seretos/lib-python-harness@v0.0.4",
 ]
 
 [project.optional-dependencies]
@@ -30,4 +30,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "-ra --strict-markers"
+addopts = "-ra --strict-markers -m 'not live'"
+markers = [
+  "live: needs the real `claude` CLI; deselected by default, run with `python -m pytest -m live`",
+]

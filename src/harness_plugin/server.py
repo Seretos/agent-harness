@@ -14,6 +14,7 @@ from lib_python_harness import (
     HostContext,
     Isolation,
     RunSpec,
+    RunState,
     discover,
     resolve,
 )
@@ -93,13 +94,18 @@ def harness_start_agent(
     permission_mode: str | None = None,
     effort: str | None = None,
     label: str | None = None,
+    prompt: str | None = None,
 ) -> dict[str, Any]:
     """Start a discovered subagent (by qualified_name) as a background run and return its
     run_id immediately; use harness_poll_run or harness_wait_run for the result. The run
     inherits the parent session's permission mode, model, effort and cwd (collected by the
     plugin hook); explicit arguments override them. Refuses when the session context cannot
     be determined. `context_source`, `cwd`, `permission_mode` and `model` are echoed back.
-    An optional short `label` names the run and shows up in harness_list_runs."""
+    An optional short `label` names the run and shows up in harness_list_runs. An optional
+    `prompt` is the run's task (the user message); the agent definition's body stays the
+    system prompt. Without `prompt` the run gets a default task."""
+    if prompt is not None and not prompt.strip():
+        raise HarnessError("prompt must not be empty")
     data, source = load_session_context()
     if data is None:
         raise ToolError(
@@ -126,7 +132,7 @@ def harness_start_agent(
     if definition is None:
         known = ", ".join(sorted(definitions)) or "(none)"
         raise ToolError(f"unknown agent {agent!r}; known agents: {known}")
-    spec = resolve(definition, ctx)
+    spec = resolve(definition, ctx, task=prompt)
     if model:
         spec.model = model
     if spec.model is None:
@@ -209,13 +215,26 @@ def harness_send_message(run_id: str, prompt: str) -> dict[str, Any]:
 @mcp.tool()
 @_tool_errors
 async def harness_wait_run(run_id: str, timeout_seconds: float = 300.0) -> dict[str, Any]:
-    """Block until the run finishes and return its result. WARNING: if `timeout_seconds`
-    (default 300) expires first, the deadline cancels the run (terminal state CANCELLED)
-    rather than just giving up waiting; use harness_poll_run to check without cancelling.
-    For a run that may outlast a tool call, do not block here: run the shell command
-    `harness wait-run --run-id <id> --timeout <s>` in the background instead (see the
-    `harness-wait` skill); its timeout never cancels the run."""
-    result = await anyio.to_thread.run_sync(partial(harness().wait, run_id, timeout_seconds))
+    """Wait up to `timeout_seconds` (default 300) for the run to finish and return its
+    result. The time limit ends only the waiting, never the run: nothing is cancelled. If
+    it expires first the run is still RUNNING and the answer says so, with liveness fields
+    (`duration_s`, `event_count`, `last_event_at`, `last_activity` = the last tool/command
+    the run used) and a `next_step` hint. Only harness_stop_run cancels a run. To keep
+    waiting past a tool call, run the shell command `harness wait <run_id>` in the
+    background (blocks until the run ends; see the `harness-wait` skill), or call this
+    tool again; harness_poll_run checks without waiting."""
+    h = harness()
+    result = await anyio.to_thread.run_sync(partial(h.wait, run_id, timeout_seconds))
+    if result.state == RunState.RUNNING:
+        return run_to_dict(
+            result,
+            next_step=(
+                f"The run is still RUNNING; the timeout only ended the waiting and nothing "
+                f"was cancelled. Keep waiting with `harness wait {run_id}` (run it via Bash "
+                f"in the background) or call harness_wait_run again. Only harness_stop_run "
+                f"cancels the run."
+            ),
+        )
     return run_to_dict(result)
 
 

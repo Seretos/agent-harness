@@ -1,4 +1,4 @@
-"""Run helpers shared by the MCP server and the `wait-run` subcommand.
+"""Run helpers shared by the MCP server and the `wait` subcommand.
 
 Deliberately free of mcp/FastMCP imports: the subcommand must start without them."""
 from __future__ import annotations
@@ -57,6 +57,7 @@ def run_to_dict(result: Any, **extra: Any) -> dict[str, Any]:
         "duration_s": result.duration_s,
         "event_count": result.event_count,
         "last_event_at": result.last_event_at,
+        "last_activity": result.last_activity,
     }
     out.update(extra)
     return out

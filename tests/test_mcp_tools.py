@@ -80,7 +80,6 @@ def test_tools_list_exposes_harness_tools_and_no_ping(server_params):
     for t in tools:
         assert len((t.description or "").strip()) >= 20, f"{t.name} has no real description"
     wait_desc = next(t for t in tools if t.name == "harness_wait_run").description.lower()
-    assert "cancel" in wait_desc, "wait description must warn that the deadline cancels the run"
     desc = {t.name: (t.description or "").lower() for t in tools}
     # Phrase-level checks: the wording must explain the purpose / semantics, not just
     # mention a token.
@@ -108,6 +107,18 @@ def test_tools_list_exposes_harness_tools_and_no_ping(server_params):
     )
     assert "harness_wait_run" in send_desc and "harness_poll_run" in send_desc, (
         "send_message description must point to harness_wait_run / harness_poll_run"
+    )
+    start_agent = next(t for t in tools if t.name == "harness_start_agent")
+    assert "prompt" in start_agent.inputSchema["properties"], (
+        "harness_start_agent must expose an optional `prompt` argument"
+    )
+    assert "prompt" not in start_agent.inputSchema.get("required", [])
+    start_agent_desc = desc["harness_start_agent"]
+    assert re.search(r"prompt[^.]*(task|user message)", start_agent_desc), (
+        "start_agent description must say `prompt` is the run's task / user message"
+    )
+    assert re.search(r"(body|definition)[^.]*system prompt", start_agent_desc), (
+        "start_agent description must say the definition body stays the system prompt"
     )
     for name in ("harness_start_agent", "harness_start_prompt"):
         assert re.search(r"label[^.]*harness_list_runs|harness_list_runs[^.]*label", desc[name]), (
@@ -190,21 +201,42 @@ def test_wait_run_returns_completed_result(server_params, project_dir):
     assert final["session_id"]
 
 
-def test_wait_run_deadline_cancels_and_server_stays_responsive(server_params, project_dir):
+def test_wait_run_deadline_leaves_run_running_with_liveness_and_hint(server_params, project_dir):
     async def scenario(session):
         is_error, text, started = await _call(
-            session, "harness_start_prompt", prompt="SLEEP:30", model="sonnet"
+            session, "harness_start_prompt", prompt="TOOL:Bash SLEEP:6", model="sonnet"
         )
         assert not is_error, text
-        waited = await _call(
-            session, "harness_wait_run", run_id=started["run_id"], timeout_seconds=1
-        )
+        run_id = started["run_id"]
+        t0 = time.monotonic()
+        waited = await _call(session, "harness_wait_run", run_id=run_id, timeout_seconds=1)
+        elapsed = time.monotonic() - t0
+        polled = await _call(session, "harness_poll_run", run_id=run_id)
+        final = await _poll_until_terminal(session, run_id)
         after = await _call(session, "harness_list_agents", cwd=str(project_dir))
-        return waited, after
+        # a second run with a different tool: last_activity must follow the emitted event
+        _, _, started2 = await _call(
+            session, "harness_start_prompt", prompt="TOOL:Read SLEEP:3", model="sonnet"
+        )
+        waited2 = await _call(
+            session, "harness_wait_run", run_id=started2["run_id"], timeout_seconds=1
+        )
+        assert waited2[2]["last_activity"] == "tool_use:Read"
+        return run_id, waited, elapsed, polled, final, after
 
-    waited, after = _run(scenario, server_params)
+    run_id, waited, elapsed, polled, final, after = _run(scenario, server_params)
     assert waited[0] is False, waited[1]
-    assert waited[2]["state"] == "CANCELLED"
+    result = waited[2]
+    assert result["state"] == "RUNNING"
+    assert elapsed < 5, "the wait must return at its limit, not when the run ends"
+    assert result["last_activity"] == "tool_use:Bash"
+    assert result["last_event_at"] is not None
+    assert result["event_count"] >= 1
+    assert result["duration_s"] > 0
+    assert run_id in result["next_step"]
+    assert "harness wait" in result["next_step"]
+    assert polled[2]["state"] == "RUNNING", "the wait limit must not cancel the run"
+    assert final["state"] == "COMPLETED"
     assert after[0] is False, after[1]
 
 
@@ -284,12 +316,13 @@ def test_wait_run_does_not_block_other_tool_calls(server_params, project_dir):
             await anyio.sleep(0.5)
             listed = await _call(session, "harness_list_agents", cwd=str(project_dir))
             still_waiting = not wait_done.is_set()
+        await _call(session, "harness_stop_run", run_id=started["run_id"])
         return listed, still_waiting, box["wait"]
 
     listed, still_waiting, waited = _run(scenario, server_params)
     assert listed[0] is False, listed[1]
     assert still_waiting, "list_agents only returned after the wait finished"
-    assert waited[2]["state"] == "CANCELLED"
+    assert waited[2]["state"] == "RUNNING", "an expired wait must not cancel the run"
 
 
 # --- harness_list_runs + progress fields (#6) -------------------------------------
@@ -346,7 +379,8 @@ def test_list_runs_lists_runs_same_server_and_after_restart(server_params, proje
         if sys.platform == "win32":
             # Ending the stdio session kills the server's process tree, including the
             # detached fake-claude child, so after a restart the orphan may be reconciled
-            # to FAILED (same limitation as the skipped wait-run cancel test).
+            # to FAILED (re-verified on lib-python-harness v0.0.4: still fails 5/5 without
+            # this allowance; same limitation as the skipped wait-run cancel test).
             assert rows[sleeper_id]["state"] in {"RUNNING", "FAILED"}
         else:
             assert rows[sleeper_id]["state"] == "RUNNING"
@@ -629,3 +663,51 @@ def test_send_message_error_paths(server_params, argv_log):
     assert cleaned[0] is True
     assert "HarnessError" in cleaned[1]
     assert alive[0] is False, alive[1]
+
+
+def _agents_payload(record):
+    return json.loads(_flag(record["argv"], "--agents"))
+
+
+def test_start_agent_prompt_becomes_user_message_and_body_stays_agent_prompt(
+    server_params, project_dir, argv_log
+):
+    started, final = _start_and_finish(
+        server_params, agent="demo", cwd=str(project_dir), model="sonnet", prompt="ECHO:CBA"
+    )
+    assert final["state"] == "COMPLETED"
+    # The fake CLI answers from stdin: the definition body ("Say OK.") has no ECHO marker,
+    # so "CBA" proves the prompt reached the run as its user message.
+    assert final["text"] == "CBA"
+    (record,) = _argv_records(argv_log)
+    agent_prompt = _agents_payload(record)["demo"]["prompt"]
+    assert "Say OK." in agent_prompt, "the definition body must stay the agent's system prompt"
+    assert "ECHO" not in agent_prompt, "the task must not leak into the agent's system prompt"
+    assert _flag(record["argv"], "--agent") == "demo"
+
+
+def test_start_agent_without_prompt_keeps_body_as_user_message(
+    server_params, project_dir, argv_log
+):
+    _, final = _start_and_finish(
+        server_params, agent="demo", cwd=str(project_dir), model="sonnet"
+    )
+    assert final["text"] == "OK"
+    (record,) = _argv_records(argv_log)
+    assert "Say OK." in _agents_payload(record)["demo"]["prompt"]
+
+
+@pytest.mark.parametrize("blank", ["", "   \n\t"], ids=["empty", "whitespace"])
+def test_start_agent_refuses_blank_prompt_without_spawning(
+    server_params, project_dir, argv_log, blank
+):
+    async def scenario(session):
+        return await _call(
+            session, "harness_start_agent", agent="demo", cwd=str(project_dir),
+            model="sonnet", prompt=blank,
+        )
+
+    is_error, text, _ = _run(scenario, server_params)
+    assert is_error
+    assert "empty" in text.lower()
+    assert not argv_log.exists() or not _argv_records(argv_log)
