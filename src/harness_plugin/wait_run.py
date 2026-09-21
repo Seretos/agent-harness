@@ -1,4 +1,4 @@
-"""`harness wait-run`: block until a run (started by the MCP server, a different process)
+"""`harness wait <run_id>`: block until a run (started by the MCP server, a different process)
 ends, print one JSON object, and report the outcome as the exit code.
 
 Never cancels: a wait timeout leaves the run RUNNING. Imports no mcp/FastMCP code."""
@@ -26,12 +26,13 @@ _EPILOG = """\
 exit codes:
   0  run COMPLETED
   1  run FAILED
-  2  --timeout elapsed first; the run is left RUNNING (never cancelled)
+  2  --timeout (if given) elapsed first; the run is left RUNNING (never cancelled)
   3  run CANCELLED
   4  error: unknown run id, unreadable artifacts dir, or invalid arguments
 
 stdout is exactly one JSON object shaped like harness_poll_run's result, plus
-`waited_s` (measured seconds spent waiting). Diagnostics go to stderr."""
+`waited_s` (measured seconds spent waiting). Without --timeout it waits until the
+run ends. Diagnostics go to stderr."""
 
 
 class _Parser(argparse.ArgumentParser):
@@ -43,14 +44,17 @@ class _Parser(argparse.ArgumentParser):
 
 def _parser() -> argparse.ArgumentParser:
     p = _Parser(
-        prog="harness wait-run",
+        prog="harness wait",
         description="Wait for a harness run to end without ever cancelling it.",
         epilog=_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--run-id", required=True, help="run to wait for")
+    p.add_argument("run_id", help="run to wait for")
     p.add_argument(
-        "--timeout", required=True, type=float, help="give up waiting after this many seconds"
+        "--timeout",
+        type=float,
+        default=None,
+        help="give up waiting after this many seconds (default: wait until the run ends)",
     )
     p.add_argument(
         "--interval", type=float, default=2.0, help="poll interval in seconds (default 2, min 0.2)"
@@ -64,9 +68,10 @@ def main(argv: list[str]) -> int:
     started = time.monotonic()
     try:
         h = Harness(store=FileRunStore(artifacts_root()), claude_argv=claude_argv())
-        result = h.wait_for(args.run_id, timeout=max(args.timeout, 0.0), poll_interval=interval)
+        timeout = None if args.timeout is None else max(args.timeout, 0.0)
+        result = h.wait(args.run_id, timeout=timeout, poll_interval=interval)
     except (HarnessError, OSError) as exc:
-        print(f"harness wait-run: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print(f"harness wait: {type(exc).__name__}: {exc}", file=sys.stderr)
         return EXIT_ERROR
     waited = round(time.monotonic() - started, 1)
     sys.stdout.write(json.dumps(run_to_dict(result, waited_s=waited)) + "\n")

@@ -46,24 +46,24 @@ pwsh -File scripts/build.ps1 -Clean -Package
 
 Output on Windows: `bin/harness.exe`. On Linux: `bin/harness`. Then install via `/plugin install <path>`.
 
-## Waiting for a long run: `harness wait-run`
+## Waiting for a long run: `harness wait <run_id>`
 
-`harness_wait_run` cancels the run when its timeout expires. To wait for a run that outlasts a tool call, run the binary's second entry point from a background shell (see the `harness-wait` skill):
+No time limit in this plugin ends a run. When `harness_wait_run`'s `timeout_seconds` expires the run keeps going: the tool returns `state: RUNNING` with liveness fields (`duration_s`, `event_count`, `last_event_at`, `last_activity` - the last tool/command the run used) and a `next_step` hint. Only `harness_stop_run` cancels a run. To keep waiting beyond a tool call, run the binary's second entry point from a background shell (see the `harness-wait` skill), or call `harness_wait_run` again:
 
 ```
-harness wait-run --run-id <id> --timeout <seconds> [--interval <seconds>]
+harness wait <run_id> [--timeout <seconds>] [--interval <seconds>]
 ```
 
 `harness_list_runs` lists all recorded runs as compact rows (`run_id`, `state`, `model`, `cwd`, `created_at`, `label`; no text or usage) so a lost `run_id` can be found again; `harness_start_prompt`/`harness_start_agent` accept an optional `label`, `harness_start_agent` also accepts an optional `prompt` (the run's task / user message; the agent definition's body stays its system prompt), and `harness_poll_run` reports `event_count`/`last_event_at` while a run is RUNNING.
 
 `harness_send_message(run_id, prompt)` sends a follow-up to a **finished** run: it resumes the origin's session (keeping its isolation) and returns a new RUNNING run with its own `run_id`; then use `harness_wait_run` or `harness_poll_run` on it.
 
-It prints one `harness_poll_run`-shaped JSON object plus `waited_s` on stdout and never cancels the run. `--timeout` is required; `--interval` defaults to 2 (minimum 0.2).
+It prints one `harness_poll_run`-shaped JSON object plus `waited_s` on stdout and never cancels the run. Without `--timeout` it blocks until the run ends; `--interval` defaults to 2 (minimum 0.2).
 
 | exit code | meaning |
 | --------- | ------- |
 | 0 | run COMPLETED |
 | 1 | run FAILED |
-| 2 | `--timeout` elapsed; the run is still RUNNING |
+| 2 | `--timeout` (if given) elapsed; the run is still RUNNING |
 | 3 | run CANCELLED |
 | 4 | error: unknown run id, unreadable artifacts dir, or invalid arguments |

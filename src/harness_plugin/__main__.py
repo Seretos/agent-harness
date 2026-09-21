@@ -6,7 +6,7 @@ if __name__ == "__main__":
         from harness_plugin.hooks.write_context import main as hook_main
 
         sys.exit(hook_main())
-    if len(sys.argv) > 1 and sys.argv[1] == "wait-run":
+    if len(sys.argv) > 1 and sys.argv[1] == "wait":
         # Also before mcp: a background wait process needs no FastMCP.
         from harness_plugin.wait_run import main as wait_run_main
 

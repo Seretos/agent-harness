@@ -314,17 +314,17 @@ if ((Test-Path $hookFile) -and ((Get-Content -Raw $hookFile) -match 'acceptEdits
 }
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $hookData, $hookIn
 
-# 6c. Smoke-test: the frozen binary's `wait-run` subcommand parses and documents itself.
+# 6c. Smoke-test: the frozen binary's `wait` subcommand parses and documents itself.
 # `--help` needs no run store; the full behaviour is exercised against this binary by the
 # HARNESS_BIN pytest step in test.yml.
-Write-Step "Smoke-testing the wait-run subcommand (--help)"
-$waitHelp = & (Join-Path $root "bin/$ExeName") wait-run --help 2>&1 | Out-String
-if ($LASTEXITCODE -eq 0 -and $waitHelp -match '--run-id' -and $waitHelp -match '--interval' -and $waitHelp -match 'exit codes') {
-    Write-Host "    wait-run --help OK" -ForegroundColor Green
+Write-Step "Smoke-testing the wait subcommand (--help)"
+$waitHelp = & (Join-Path $root "bin/$ExeName") wait --help 2>&1 | Out-String
+if ($LASTEXITCODE -eq 0 -and $waitHelp -match 'run_id' -and $waitHelp -match '--interval' -and $waitHelp -match 'exit codes') {
+    Write-Host "    wait --help OK" -ForegroundColor Green
 } else {
     Write-Host "    exit: $LASTEXITCODE" -ForegroundColor Yellow
     Write-Host "    output: $waitHelp" -ForegroundColor Yellow
-    Fail "wait-run smoke failed -- --help must exit 0 and list --run-id, --interval and the exit codes."
+    Fail "wait smoke failed -- --help must exit 0 and list run_id, --interval and the exit codes."
 }
 
 # 7. Optional: stage build/stage/agent-harness/ for the assembly step in

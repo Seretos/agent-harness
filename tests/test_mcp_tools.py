@@ -316,12 +316,13 @@ def test_wait_run_does_not_block_other_tool_calls(server_params, project_dir):
             await anyio.sleep(0.5)
             listed = await _call(session, "harness_list_agents", cwd=str(project_dir))
             still_waiting = not wait_done.is_set()
+        await _call(session, "harness_stop_run", run_id=started["run_id"])
         return listed, still_waiting, box["wait"]
 
     listed, still_waiting, waited = _run(scenario, server_params)
     assert listed[0] is False, listed[1]
     assert still_waiting, "list_agents only returned after the wait finished"
-    assert waited[2]["state"] == "CANCELLED"
+    assert waited[2]["state"] == "RUNNING", "an expired wait must not cancel the run"
 
 
 # --- harness_list_runs + progress fields (#6) -------------------------------------
