@@ -80,7 +80,6 @@ def test_tools_list_exposes_harness_tools_and_no_ping(server_params):
     for t in tools:
         assert len((t.description or "").strip()) >= 20, f"{t.name} has no real description"
     wait_desc = next(t for t in tools if t.name == "harness_wait_run").description.lower()
-    assert "cancel" in wait_desc, "wait description must warn that the deadline cancels the run"
     desc = {t.name: (t.description or "").lower() for t in tools}
     # Phrase-level checks: the wording must explain the purpose / semantics, not just
     # mention a token.
@@ -202,21 +201,42 @@ def test_wait_run_returns_completed_result(server_params, project_dir):
     assert final["session_id"]
 
 
-def test_wait_run_deadline_cancels_and_server_stays_responsive(server_params, project_dir):
+def test_wait_run_deadline_leaves_run_running_with_liveness_and_hint(server_params, project_dir):
     async def scenario(session):
         is_error, text, started = await _call(
-            session, "harness_start_prompt", prompt="SLEEP:30", model="sonnet"
+            session, "harness_start_prompt", prompt="TOOL:Bash SLEEP:6", model="sonnet"
         )
         assert not is_error, text
-        waited = await _call(
-            session, "harness_wait_run", run_id=started["run_id"], timeout_seconds=1
-        )
+        run_id = started["run_id"]
+        t0 = time.monotonic()
+        waited = await _call(session, "harness_wait_run", run_id=run_id, timeout_seconds=1)
+        elapsed = time.monotonic() - t0
+        polled = await _call(session, "harness_poll_run", run_id=run_id)
+        final = await _poll_until_terminal(session, run_id)
         after = await _call(session, "harness_list_agents", cwd=str(project_dir))
-        return waited, after
+        # a second run with a different tool: last_activity must follow the emitted event
+        _, _, started2 = await _call(
+            session, "harness_start_prompt", prompt="TOOL:Read SLEEP:3", model="sonnet"
+        )
+        waited2 = await _call(
+            session, "harness_wait_run", run_id=started2["run_id"], timeout_seconds=1
+        )
+        assert waited2[2]["last_activity"] == "tool_use:Read"
+        return run_id, waited, elapsed, polled, final, after
 
-    waited, after = _run(scenario, server_params)
+    run_id, waited, elapsed, polled, final, after = _run(scenario, server_params)
     assert waited[0] is False, waited[1]
-    assert waited[2]["state"] == "CANCELLED"
+    result = waited[2]
+    assert result["state"] == "RUNNING"
+    assert elapsed < 5, "the wait must return at its limit, not when the run ends"
+    assert result["last_activity"] == "tool_use:Bash"
+    assert result["last_event_at"] is not None
+    assert result["event_count"] >= 1
+    assert result["duration_s"] > 0
+    assert run_id in result["next_step"]
+    assert "harness wait" in result["next_step"]
+    assert polled[2]["state"] == "RUNNING", "the wait limit must not cancel the run"
+    assert final["state"] == "COMPLETED"
     assert after[0] is False, after[1]
 
 
@@ -296,12 +316,13 @@ def test_wait_run_does_not_block_other_tool_calls(server_params, project_dir):
             await anyio.sleep(0.5)
             listed = await _call(session, "harness_list_agents", cwd=str(project_dir))
             still_waiting = not wait_done.is_set()
+        await _call(session, "harness_stop_run", run_id=started["run_id"])
         return listed, still_waiting, box["wait"]
 
     listed, still_waiting, waited = _run(scenario, server_params)
     assert listed[0] is False, listed[1]
     assert still_waiting, "list_agents only returned after the wait finished"
-    assert waited[2]["state"] == "CANCELLED"
+    assert waited[2]["state"] == "RUNNING", "an expired wait must not cancel the run"
 
 
 # --- harness_list_runs + progress fields (#6) -------------------------------------

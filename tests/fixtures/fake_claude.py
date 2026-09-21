@@ -11,6 +11,8 @@ exits after the init event without any `result` event (a FAILED run).
 A prompt containing `TICK:<count>:<interval>` emits `count` assistant events
 `interval` seconds apart (flushed) before the terminal `result` event, so a
 still-RUNNING run makes visible progress.
+A prompt containing `TOOL:<name>` emits one assistant `tool_use` event for that tool right
+after the init event (before any SLEEP), so a still-RUNNING run's last activity is that tool.
 A prompt containing `ECHO:<word>` is answered with `<word>` instead of `OK`. The session
 id is taken from `--session-id <id>` or, for a resumed run, `--resume <id>`.
 """
@@ -40,6 +42,23 @@ def main() -> int:
     prompt = sys.stdin.read()
     match = re.search(r"SLEEP:(\d+(?:\.\d+)?)", prompt)
     print(json.dumps({"type": "system", "subtype": "init", "session_id": session_id}), flush=True)
+    tool = re.search(r"TOOL:(\w+)", prompt)
+    if tool:
+        print(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "toolu_1", "name": tool.group(1), "input": {}}
+                        ],
+                    },
+                    "session_id": session_id,
+                }
+            ),
+            flush=True,
+        )
     if match:
         deadline = time.monotonic() + float(match.group(1))
         while time.monotonic() < deadline:
