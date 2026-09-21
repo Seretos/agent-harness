@@ -54,7 +54,7 @@ Output on Windows: `bin/harness.exe`. On Linux: `bin/harness`. Then install via 
 harness wait-run --run-id <id> --timeout <seconds> [--interval <seconds>]
 ```
 
-`harness_list_runs` lists all recorded runs as compact rows (`run_id`, `state`, `model`, `cwd`, `created_at`, `label`; no text or usage) so a lost `run_id` can be found again; `harness_start_prompt`/`harness_start_agent` accept an optional `label`, and `harness_poll_run` reports `event_count`/`last_event_at` while a run is RUNNING.
+`harness_list_runs` lists all recorded runs as compact rows (`run_id`, `state`, `model`, `cwd`, `created_at`, `label`; no text or usage) so a lost `run_id` can be found again; `harness_start_prompt`/`harness_start_agent` accept an optional `label`, `harness_start_agent` also accepts an optional `prompt` (the run's task / user message; the agent definition's body stays its system prompt), and `harness_poll_run` reports `event_count`/`last_event_at` while a run is RUNNING.
 
 `harness_send_message(run_id, prompt)` sends a follow-up to a **finished** run: it resumes the origin's session (keeping its isolation) and returns a new RUNNING run with its own `run_id`; then use `harness_wait_run` or `harness_poll_run` on it.
 

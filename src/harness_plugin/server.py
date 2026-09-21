@@ -94,13 +94,18 @@ def harness_start_agent(
     permission_mode: str | None = None,
     effort: str | None = None,
     label: str | None = None,
+    prompt: str | None = None,
 ) -> dict[str, Any]:
     """Start a discovered subagent (by qualified_name) as a background run and return its
     run_id immediately; use harness_poll_run or harness_wait_run for the result. The run
     inherits the parent session's permission mode, model, effort and cwd (collected by the
     plugin hook); explicit arguments override them. Refuses when the session context cannot
     be determined. `context_source`, `cwd`, `permission_mode` and `model` are echoed back.
-    An optional short `label` names the run and shows up in harness_list_runs."""
+    An optional short `label` names the run and shows up in harness_list_runs. An optional
+    `prompt` is the run's task (the user message); the agent definition's body stays the
+    system prompt. Without `prompt` the run gets a default task."""
+    if prompt is not None and not prompt.strip():
+        raise HarnessError("prompt must not be empty")
     data, source = load_session_context()
     if data is None:
         raise ToolError(
@@ -127,7 +132,7 @@ def harness_start_agent(
     if definition is None:
         known = ", ".join(sorted(definitions)) or "(none)"
         raise ToolError(f"unknown agent {agent!r}; known agents: {known}")
-    spec = resolve(definition, ctx)
+    spec = resolve(definition, ctx, task=prompt)
     if model:
         spec.model = model
     if spec.model is None:
