@@ -55,7 +55,17 @@ jobs:
 
       - name: Run pytest
         shell: bash
-        run: python -m pytest
+        # TEMPORARY: -s (--capture=no) while diagnosing this PR's hang. pytest's
+        # default fd-level capture buffers each test's stdout/stderr -- including
+        # a raw faulthandler_timeout dump -- and only plays it back when that test
+        # finishes (pass or fail). A test killed by the job's own timeout-minutes
+        # never finishes, so the capture buffer (and any dump in it) is lost with
+        # it; -s routes output straight through instead, so it survives the kill.
+        # PYTHONUNBUFFERED=1 belt-and-braces against Python's own stdout
+        # block-buffering when not attached to a TTY. Revert once the hang is found.
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: python -m pytest -s
 
   # Frozen-binary check: builds the PyInstaller binary and smoke-tests it with a
   # real MCP initialize + tools/list (fails if lib_python_harness is not bundled).
