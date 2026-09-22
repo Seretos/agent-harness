@@ -135,6 +135,64 @@ def test_tools_list_exposes_harness_tools_and_no_ping(server_params):
         )
 
 
+def test_start_tools_document_accepted_values(server_params):
+    """R3: tools/list names the accepted values for model/effort/permission_mode, per
+    tool. `harness_start_agent`'s inputSchema.properties for model, effort and
+    permission_mode each carry a description naming that parameter's value list;
+    harness_start_prompt's do so for model and effort, has no permission_mode
+    property at all, and its tool description says it sends no permission mode to
+    the child and does not inherit the parent's. Fixed literal tokens, written
+    independently of _ACCEPTED_VALUES (asserting against the constant the code
+    consumed would be vacuous), all plain substring/regex presence, no proximity
+    conditions."""
+
+    async def scenario(session):
+        return (await session.list_tools()).tools
+
+    tools = _run(scenario, server_params)
+    by_name = {t.name: t for t in tools}
+
+    start_agent = by_name["harness_start_agent"]
+    agent_props = start_agent.inputSchema["properties"]
+
+    effort_desc = agent_props["effort"].get("description") or ""
+    assert "low" in effort_desc and "medium" in effort_desc and "high" in effort_desc, (
+        "harness_start_agent effort description must name low/medium/high"
+    )
+    assert "--effort" in effort_desc
+
+    model_desc = agent_props["model"].get("description") or ""
+    for token in ("opus", "sonnet", "haiku", "claude-"):
+        assert token in model_desc, f"harness_start_agent model description missing {token!r}"
+
+    perm_desc = agent_props["permission_mode"].get("description") or ""
+    for token in ("default", "acceptEdits", "plan", "bypassPermissions", "inherit"):
+        assert token in perm_desc, (
+            f"harness_start_agent permission_mode description missing {token!r}"
+        )
+
+    start_prompt = by_name["harness_start_prompt"]
+    prompt_props = start_prompt.inputSchema["properties"]
+
+    prompt_effort_desc = prompt_props["effort"].get("description") or ""
+    assert (
+        "low" in prompt_effort_desc and "medium" in prompt_effort_desc and "high" in prompt_effort_desc
+    ), "harness_start_prompt effort description must name low/medium/high"
+
+    prompt_model_desc = prompt_props["model"].get("description") or ""
+    for token in ("opus", "sonnet", "haiku", "claude-"):
+        assert token in prompt_model_desc, f"harness_start_prompt model description missing {token!r}"
+
+    assert "permission_mode" not in prompt_props, (
+        "harness_start_prompt must not expose a permission_mode parameter"
+    )
+    start_prompt_desc = start_prompt.description or ""
+    assert "--permission-mode" in start_prompt_desc
+    assert "not inherited" in start_prompt_desc.lower(), (
+        "harness_start_prompt description must say the parent session's mode is not inherited"
+    )
+
+
 def test_list_agents_returns_project_agent(server_params, project_dir):
     async def scenario(session):
         return await _call(session, "harness_list_agents", cwd=str(project_dir))
@@ -542,6 +600,241 @@ def test_start_agent_explicit_permission_mode_overrides_file_lacking_one(
     assert final["state"] == "COMPLETED"
     (record,) = _argv_records(argv_log)
     assert _flag(record["argv"], "--permission-mode") == "plan"
+
+
+# --- effort echo + provenance (#25) -----------------------------------------------
+
+
+def test_effort_is_echoed_at_start_and_in_poll_and_wait(server_params, session_context, argv_log):
+    """R1: harness_start_agent, harness_start_prompt and harness_send_message
+    responses, and harness_poll_run/harness_wait_run for those same run_ids, carry
+    `effort` equal to the `--effort` token in that run's argv-log record. Also checks
+    the model/permission_mode consolidation (both must still equal their argv tokens
+    now that they come from launched_fields() instead of their own extras)."""
+
+    async def scenario(session):
+        is_error, text, started = await _call(session, "harness_start_agent", agent="demo")
+        assert not is_error, text
+        final = await _poll_until_terminal(session, started["run_id"])
+        waited = await _call(
+            session, "harness_wait_run", run_id=started["run_id"], timeout_seconds=30
+        )
+
+        is_error2, text2, started_prompt = await _call(
+            session, "harness_start_prompt", prompt="Say OK.", model="sonnet", effort="low"
+        )
+        assert not is_error2, text2
+        final_prompt = await _poll_until_terminal(session, started_prompt["run_id"])
+
+        sent = await _call(
+            session, "harness_send_message", run_id=started_prompt["run_id"], prompt="hi"
+        )
+        assert not sent[0], sent[1]
+        follow_up = sent[2]
+        final_follow_up = await _poll_until_terminal(session, follow_up["run_id"])
+
+        return started, final, waited, started_prompt, final_prompt, follow_up, final_follow_up
+
+    (
+        started,
+        final,
+        waited,
+        started_prompt,
+        final_prompt,
+        follow_up,
+        final_follow_up,
+    ) = _run(scenario, server_params)
+
+    assert waited[0] is False, waited[1]
+    waited_payload = waited[2]
+
+    records = _argv_records(argv_log)
+    agent_effort = _flag(records[0]["argv"], "--effort")
+    assert agent_effort == "high"  # inherited from session_context
+    assert started["effort"] == agent_effort
+    assert final["effort"] == agent_effort
+    assert waited_payload["effort"] == agent_effort
+    # consolidation: model/permission_mode must still equal their argv tokens
+    assert started["model"] == _flag(records[0]["argv"], "--model")
+    assert started["permission_mode"] == _flag(records[0]["argv"], "--permission-mode")
+
+    prompt_effort = _flag(records[1]["argv"], "--effort")
+    assert prompt_effort == "low"
+    assert started_prompt["effort"] == "low"
+    assert final_prompt["effort"] == "low"
+
+    follow_up_effort = _flag(records[2]["argv"], "--effort")
+    assert follow_up_effort == "low"
+    assert follow_up["effort"] == "low"
+    assert final_follow_up["effort"] == "low"
+
+
+def test_effort_is_null_and_absent_from_argv_when_nothing_supplies_it(
+    server_params, tmp_path, project_dir, argv_log
+):
+    """R1 additional edge-case coverage: a session context planted without `effort`
+    and no explicit argument -> "--effort" not in argv and payload["effort"] is
+    None."""
+    plant_session_file(
+        tmp_path / "plugin-data",
+        SESSION_ID,
+        cwd=str(project_dir),
+        permission_mode="acceptEdits",
+        model="opus",
+    )
+
+    async def scenario(session):
+        is_error, text, started = await _call(session, "harness_start_agent", agent="demo")
+        assert not is_error, text
+        return started, await _poll_until_terminal(session, started["run_id"])
+
+    started, final = _run(scenario, server_params)
+    (record,) = _argv_records(argv_log)
+    assert "--effort" not in record["argv"]
+    assert started["effort"] is None
+    assert final["effort"] is None
+
+
+@pytest.mark.parametrize(
+    "kwargs,expect_source,expect_effort",
+    [
+        pytest.param(
+            {"agent": "effort-agent", "effort": "low"},
+            "agent_definition",
+            "medium",
+            id="definition-wins-over-argument-and-session",
+        ),
+        pytest.param(
+            {"agent": "demo", "effort": "low"},
+            "argument",
+            "low",
+            id="explicit-argument",
+        ),
+        pytest.param(
+            {"agent": "demo"},
+            "parent_session",
+            "high",
+            id="inherited-from-session",
+        ),
+    ],
+)
+def test_effort_source_reports_where_the_value_came_from_for_start_agent(
+    server_params, session_context, project_dir, argv_log, kwargs, expect_source, expect_effort
+):
+    """R2 (a)-(c): effort_source is agent_definition when the definition sets
+    effort:, argument for an explicit argument with no definition value,
+    parent_session for the inherited snapshot value -- and it persists into the
+    later poll answer. `effort-agent`'s own frontmatter value must win over both the
+    explicit argument and the session's `effort: high` (pre-existing library
+    behaviour: `effort = definition.effort or host_context.effort`, with no
+    argument re-application for effort, unlike model)."""
+
+    async def scenario(session):
+        is_error, text, started = await _call(session, "harness_start_agent", **kwargs)
+        assert not is_error, text
+        polled = await _call(session, "harness_poll_run", run_id=started["run_id"])
+        assert not polled[0], polled[1]
+        return started, polled[2]
+
+    started, polled = _run(scenario, server_params)
+    (record,) = _argv_records(argv_log)
+    assert _flag(record["argv"], "--effort") == expect_effort
+    assert started["effort"] == expect_effort
+    assert started["effort_source"] == expect_source
+    assert polled["effort"] == expect_effort
+    assert polled["effort_source"] == expect_source
+
+
+def test_effort_source_none_when_session_lacks_effort(
+    server_params, tmp_path, project_dir, argv_log
+):
+    """R2 (d): a session file without `effort` and no explicit argument ->
+    effort_source == "none", no --effort token."""
+    plant_session_file(
+        tmp_path / "plugin-data",
+        SESSION_ID,
+        cwd=str(project_dir),
+        permission_mode="acceptEdits",
+        model="opus",
+    )
+
+    async def scenario(session):
+        is_error, text, started = await _call(session, "harness_start_agent", agent="demo")
+        assert not is_error, text
+        polled = await _call(session, "harness_poll_run", run_id=started["run_id"])
+        assert not polled[0], polled[1]
+        return started, polled[2]
+
+    started, polled = _run(scenario, server_params)
+    (record,) = _argv_records(argv_log)
+    assert "--effort" not in record["argv"]
+    assert started["effort"] is None
+    assert started["effort_source"] == "none"
+    assert polled["effort_source"] == "none"
+
+
+def test_effort_source_argument_for_start_prompt(server_params, argv_log):
+    """R2 (f): harness_start_prompt(effort="low") -> effort_source == "argument"."""
+
+    async def scenario(session):
+        is_error, text, started = await _call(
+            session, "harness_start_prompt", prompt="Say OK.", model="sonnet", effort="low"
+        )
+        assert not is_error, text
+        polled = await _call(session, "harness_poll_run", run_id=started["run_id"])
+        assert not polled[0], polled[1]
+        return started, polled[2]
+
+    started, polled = _run(scenario, server_params)
+    (record,) = _argv_records(argv_log)
+    assert _flag(record["argv"], "--effort") == "low"
+    assert started["effort_source"] == "argument"
+    assert polled["effort_source"] == "argument"
+
+
+def test_effort_source_none_for_start_prompt_even_with_session_effort(
+    server_params, session_context, argv_log
+):
+    """R2 (e): harness_start_prompt with no `effort` while the session carries
+    `effort: high` -> effort_source == "none" and no --effort token -- "none" must
+    mean "CLI default", not a dropped inheritance, since harness_start_prompt never
+    reads the session context at all."""
+
+    async def scenario(session):
+        is_error, text, started = await _call(
+            session, "harness_start_prompt", prompt="Say OK.", model="sonnet"
+        )
+        assert not is_error, text
+        polled = await _call(session, "harness_poll_run", run_id=started["run_id"])
+        assert not polled[0], polled[1]
+        return started, polled[2]
+
+    started, polled = _run(scenario, server_params)
+    (record,) = _argv_records(argv_log)
+    assert "--effort" not in record["argv"]
+    assert started["effort"] is None
+    assert started["effort_source"] == "none"
+    assert polled["effort_source"] == "none"
+
+
+def test_send_message_reports_origin_runs_effort_source(server_params, argv_log):
+    """R2 additional edge-case coverage: harness_send_message on a finished run
+    reports the origin run's effort_source."""
+
+    async def scenario(session):
+        is_error, text, origin = await _call(
+            session, "harness_start_prompt", prompt="Say OK.", model="sonnet", effort="low"
+        )
+        assert not is_error, text
+        await _poll_until_terminal(session, origin["run_id"])
+        sent = await _call(session, "harness_send_message", run_id=origin["run_id"], prompt="hi")
+        assert not sent[0], sent[1]
+        return origin, sent[2]
+
+    origin, follow_up = _run(scenario, server_params)
+    assert origin["effort_source"] == "argument"
+    assert follow_up["effort_source"] == "argument"
+    assert follow_up["effort"] == "low"
 
 
 def test_list_agents_and_start_prompt_work_without_context(server_params_no_context, project_dir):

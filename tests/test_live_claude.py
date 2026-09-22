@@ -2,6 +2,7 @@
 `python -m pytest -m live`."""
 import os
 import shutil
+import subprocess
 
 import anyio
 import pytest
@@ -106,6 +107,29 @@ def test_live_start_plugin_agent_colon_qualified(live_server_params, tmp_path):
     assert announced_tools == {"Read"}, (
         "the tools allowlist must be enforced -- the default tool set must not leak"
     )
+
+
+def test_accepted_values_match_the_cli():
+    """R6: the value lists this plugin documents in its tool schemas (server.py's
+    _ACCEPTED_VALUES) are the real CLI's, not invented. Every documented `effort`
+    and `permission_mode` token must appear in the real `claude --help` output for
+    its flag. Expected RED before the change: ImportError -- _ACCEPTED_VALUES does
+    not exist yet."""
+    if shutil.which("claude") is None:
+        pytest.skip("the real `claude` CLI is not on PATH")
+
+    from harness_plugin.server import _ACCEPTED_VALUES
+
+    help_text = subprocess.run(
+        ["claude", "--help"], capture_output=True, text=True, timeout=30
+    ).stdout
+
+    for token in _ACCEPTED_VALUES["effort"]:
+        assert token in help_text, f"--effort help text is missing documented token {token!r}"
+    for token in _ACCEPTED_VALUES["permission_mode"]:
+        assert token in help_text, (
+            f"--permission-mode help text is missing documented token {token!r}"
+        )
 
 
 def test_live_wait_run_timeout_keeps_run_alive(live_server_params):
