@@ -1,5 +1,6 @@
 """Live test against the real `claude` CLI. Deselected by default; run with
 `python -m pytest -m live`."""
+import json
 import os
 import re
 import shutil
@@ -137,15 +138,79 @@ def _help_section(help_text, flag_name):
     return match.group(0)
 
 
+# Flag + real init-event field for a token whose category's --help choices
+# don't list it (currently just permission_mode's "default" -- see server.py's
+# _ACCEPTED_VALUES comment for why it stays documented anyway: a real run
+# with `--permission-mode default` completes and its stream-json init event
+# reports the value straight back). There is no generic way to know which
+# init-event field mirrors an arbitrary flag, so this map only covers the
+# category the fallback probe below is actually used for; extend it before
+# relying on the fallback for a new category.
+_LIVE_PROBE_FLAG = {"permission_mode": "--permission-mode"}
+_LIVE_PROBE_INIT_FIELD = {"permission_mode": "permissionMode"}
+
+
+def _probe_cli_accepts(category, token):
+    """Real accept/reject probe against the live CLI for a `category` token
+    that `--help`'s printed choices don't list -- proof of genuine
+    acceptance instead of trusting `--help`'s incomplete text. Mirrors the
+    manual probe that established "default" is genuinely accepted by
+    permission_mode despite --help omitting it: runs a trivial real prompt
+    with the token set and inspects the stream-json `init` event. Raises
+    AssertionError (with the CLI's own error text/exit code, or the init
+    event's mismatched field) on rejection."""
+    assert category in _LIVE_PROBE_FLAG, (
+        f"no live-probe flag/field mapping for category {category!r} -- add "
+        f"one to _LIVE_PROBE_FLAG/_LIVE_PROBE_INIT_FIELD before relying on "
+        f"the fallback probe for it"
+    )
+    flag = _LIVE_PROBE_FLAG[category]
+    result = subprocess.run(
+        [
+            "claude", flag, token,
+            "-p", "reply with just the word done",
+            "--model", "haiku",
+            "--output-format", "stream-json",
+            "--verbose",
+        ],
+        capture_output=True, text=True, timeout=90,
+    )
+    init_event = None
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "system" and event.get("subtype") == "init":
+            init_event = event
+            break
+    assert result.returncode == 0 and init_event is not None, (
+        f"claude {flag} {token!r} was rejected by the live CLI "
+        f"(exit {result.returncode}): stderr={result.stderr!r} stdout={result.stdout!r}"
+    )
+    field = _LIVE_PROBE_INIT_FIELD[category]
+    assert init_event.get(field) == token, (
+        f"claude {flag} {token!r} ran but the init event reports "
+        f"{field}={init_event.get(field)!r}, not {token!r}: {init_event}"
+    )
+    return init_event
+
+
 def test_accepted_values_match_the_cli():
     """R6: the value lists this plugin documents in its tool schemas (server.py's
     _ACCEPTED_VALUES) are the real CLI's, not invented. Every documented `effort`
     and `permission_mode` token must appear in the real `claude --help` output,
-    scoped to that flag's own help section -- not just the loop-over-the-constant
-    check, which would also pass if the app's own list were empty, truncated, or
-    matched a token that merely appears somewhere else in the help text (e.g. under
-    a different flag). Expected RED before the change: ImportError --
-    _ACCEPTED_VALUES does not exist yet."""
+    scoped to that flag's own help section -- with one exception: a token --help's
+    printed choices don't list (currently only permission_mode's "default") falls
+    back to a real accept/reject probe against the live CLI (_probe_cli_accepts),
+    since --help's printed list is a proxy for "real", not the CLI's full truth,
+    and can't see a value the CLI genuinely accepts but doesn't advertise. Every
+    token --help *does* list stays checked exactly as strictly as before -- only
+    the not-listed case gets the fallback. Expected RED before the change:
+    ImportError -- _ACCEPTED_VALUES does not exist yet."""
     if shutil.which("claude") is None:
         pytest.skip("the real `claude` CLI is not on PATH")
 
@@ -175,10 +240,12 @@ def test_accepted_values_match_the_cli():
             f"--effort help text is missing documented token {token!r}: {effort_section!r}"
         )
     for token in documented_permission_mode:
-        assert token in permission_mode_section, (
-            f"--permission-mode help text is missing documented token {token!r}: "
-            f"{permission_mode_section!r}"
-        )
+        if token in permission_mode_section:
+            continue
+        # Not among --help's printed choices for --permission-mode (e.g.
+        # "default") -- fall back to a real accept/reject probe against the
+        # live CLI instead of failing on --help's incomplete text.
+        _probe_cli_accepts("permission_mode", token)
 
 
 def test_live_wait_run_timeout_keeps_run_alive(live_server_params):

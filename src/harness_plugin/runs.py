@@ -209,6 +209,40 @@ def inspect_run(run_id: str) -> dict[str, Any]:
     }
 
 
+def launched_fields(run_id: str) -> dict[str, Any]:
+    """`model`/`effort`/`permission_mode` for `run_id`, read back from its own
+    recorded argv -- the one path every answer about a run's launched values goes
+    through (plan Approach), replacing the four call sites that used to pass their
+    own extras. `effort_source` comes from the record itself (see
+    `remember_effort_source`) and degrades to `"unknown"` when the record predates
+    this field or the run is gone -- never an error, since a still-valid poll/wait
+    on an older run must keep working."""
+    record = harness().store.get(run_id)
+    argv = (record or {}).get("argv") or []
+    return {
+        "model": _flag(argv, "--model"),
+        "effort": _flag(argv, "--effort"),
+        "permission_mode": _flag(argv, "--permission-mode"),
+        "effort_source": (record or {}).get("effort_source") or "unknown",
+    }
+
+
+def remember_effort_source(run_id: str, source: str) -> None:
+    """Persist `source` (one of `argument`/`agent_definition`/`parent_session`/
+    `none`) on `run_id`'s own record -- the only per-run carrier that already
+    crosses process boundaries (`FileRunStore` re-reads `record.json` from disk,
+    no in-process cache), so a later `harness_poll_run`/`harness_wait_run`, even
+    from a different process (e.g. `harness wait`), can answer where the launched
+    effort came from. Read-modify-put, called right after `start()`/
+    `start_resume()`; a no-op if the record is already gone."""
+    h = harness()
+    record = h.store.get(run_id)
+    if record is None:
+        return
+    record["effort_source"] = source
+    h.store.put(run_id, record)
+
+
 def artifacts_root() -> Path:
     override = os.environ.get("HARNESS_ARTIFACTS_DIR")
     root = Path(override) if override else Path.home() / ".agent-harness" / "runs"
@@ -254,6 +288,8 @@ def run_to_dict(result: Any, **extra: Any) -> dict[str, Any]:
         "last_event_at": result.last_event_at,
         "last_activity": result.last_activity,
     }
+    if result.run_id:
+        out.update(launched_fields(result.run_id))
     out.update(extra)
     return out
 
