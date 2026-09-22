@@ -27,14 +27,15 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-22.04]
     runs-on: ${{ matrix.os }}
-    # TEMPORARY: dropped from 10 to diagnose this PR's hang — every CI run on
-    # this branch got killed at ~10m (reported as `cancelled`, not
-    # `failure`/`timed_out`, which is why it looked like external interference).
-    # A known-good run finishes the whole suite in ~99s, so something hangs
-    # intermittently past that; a short timeout should surface it as a job
-    # failure with a log pointing at the stuck step instead of silently
-    # eating the full 10-minute budget. Revert to 10 once the hang is found.
-    timeout-minutes: 3
+    # Not a hang: a real `-s` run (ticket #25) showed steady progress the whole
+    # time, just slow — each test spawns a real `python -m harness_plugin`
+    # subprocess (plus its own child) over stdio, and Windows CI runners pay a
+    # heavy per-spawn tax (real-time AV scanning of every new process image)
+    # that Linux doesn't. A known-good Linux run finishes in ~99s; the same
+    # suite genuinely needs ~11 minutes on Windows. 10 was already too tight
+    # before this ticket touched it; 20 matches the `build` job's own budget
+    # below and gives real margin above the observed Windows duration.
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -55,17 +56,7 @@ jobs:
 
       - name: Run pytest
         shell: bash
-        # TEMPORARY: -s (--capture=no) while diagnosing this PR's hang. pytest's
-        # default fd-level capture buffers each test's stdout/stderr -- including
-        # a raw faulthandler_timeout dump -- and only plays it back when that test
-        # finishes (pass or fail). A test killed by the job's own timeout-minutes
-        # never finishes, so the capture buffer (and any dump in it) is lost with
-        # it; -s routes output straight through instead, so it survives the kill.
-        # PYTHONUNBUFFERED=1 belt-and-braces against Python's own stdout
-        # block-buffering when not attached to a TTY. Revert once the hang is found.
-        env:
-          PYTHONUNBUFFERED: "1"
-        run: python -m pytest -s
+        run: python -m pytest
 
   # Frozen-binary check: builds the PyInstaller binary and smoke-tests it with a
   # real MCP initialize + tools/list (fails if lib_python_harness is not bundled).
