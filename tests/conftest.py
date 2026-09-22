@@ -99,7 +99,8 @@ def project_dir(tmp_path) -> Path:
     agents = tmp_path / "project" / ".claude" / "agents"
     agents.mkdir(parents=True)
     (agents / "demo.md").write_text(
-        "---\nname: demo\ndescription: Demo agent for tests\n---\nSay OK.\n",
+        "---\nname: demo\ndescription: Demo agent for tests\n"
+        "skills: [demo-skill-a, demo-skill-b]\n---\nSay OK.\n",
         encoding="utf-8",
     )
     return tmp_path / "project"

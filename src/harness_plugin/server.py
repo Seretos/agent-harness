@@ -27,7 +27,7 @@ from harness_plugin.host_context import (
     probe_warning,
     sessions_dir,
 )
-from harness_plugin.runs import artifacts_root, harness, run_to_dict, summary_to_dict
+from harness_plugin.runs import artifacts_root, harness, inspect_run, run_to_dict, summary_to_dict
 
 mcp = FastMCP("harness")
 
@@ -251,6 +251,26 @@ def harness_cleanup_run(run_id: str) -> dict[str, Any]:
     """Forget a run's record. Artifacts on disk are kept; the run cannot be polled afterwards."""
     harness().cleanup(run_id)
     return {"run_id": run_id, "cleaned": True}
+
+
+@mcp.tool()
+@_tool_errors
+def harness_inspect_run(run_id: str) -> dict[str, Any]:
+    """Answer, for one run, what it announced, what the harness asked for, and what
+    system prompt was actually sent -- so a harness-vs-native discrepancy (e.g. a
+    tool/skill/agent count mismatch) can be diagnosed without hand-reading a Claude
+    transcript. `announced.{mcp_servers,tools,skills,agents}` are the name lists this
+    run's own CLI process announced at startup, read from its events.jsonl init event
+    (`init_event`, verbatim, or null if none was seen yet), with `announced_counts`
+    alongside. `requested.{mcp_servers,tools,skills,agents}` are the same categories
+    the harness itself put into this run, read back from its own recorded argv --
+    populated even when the init event announced nothing, since it comes from a
+    different artifact. `system_prompt` carries the exact text sent, with `source`
+    naming which carrier supplied it (--system-prompt, --agents, or the materialized
+    agent file), `chars`, `sha256`, and `recorded_sha256` (the run's own recorded
+    digest) alongside. Works on a still-RUNNING run; errors on an unknown or
+    cleaned-up run_id."""
+    return inspect_run(run_id)
 
 
 def main() -> None:
