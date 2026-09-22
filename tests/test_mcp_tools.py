@@ -290,10 +290,29 @@ def test_start_tools_document_accepted_values(server_params):
     assert (
         "low" in prompt_effort_desc and "medium" in prompt_effort_desc and "high" in prompt_effort_desc
     ), "harness_start_prompt effort description must name low/medium/high"
+    # harness_start_prompt never reads parent-session context, so its unset
+    # behaviour is the opposite direction from harness_start_agent's: no
+    # fallback exists, the flag is simply omitted. Require a genuine negated
+    # claim about the flag itself (mirrors the flag-omission check on
+    # start_prompt_desc below), not just bare token presence.
+    _assert_states_negatively(
+        prompt_effort_desc,
+        r"--effort",
+        "harness_start_prompt effort description (flag not sent when unset)",
+    )
 
     prompt_model_desc = prompt_props["model"].get("description") or ""
     for token in ("opus", "sonnet", "haiku", "claude-"):
         assert token in prompt_model_desc, f"harness_start_prompt model description missing {token!r}"
+    # Same asymmetry for model: harness_start_prompt has no session context to
+    # fall back to, so the description must say the parameter is required
+    # rather than describing a fallback target. Require a negated claim about
+    # the (absent) session-context fallback, not just bare token presence.
+    _assert_states_negatively(
+        prompt_model_desc,
+        r"session context",
+        "harness_start_prompt model description (no parent session to fall back to; must be supplied)",
+    )
 
     assert "permission_mode" not in prompt_props, (
         "harness_start_prompt must not expose a permission_mode parameter"
