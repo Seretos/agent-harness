@@ -570,27 +570,27 @@ def test_probe_warning_goes_to_stderr_not_stdout(server_params_no_context, tmp_p
 
 
 def test_list_agents_uses_session_cwd_and_respects_disabled_plugins(
-    server_params, session_context, project_dir, tmp_path
+    server_params, session_context, project_dir, plugin_agent_install, tmp_path
 ):
+    # A second, disabled plugin install -- `plugin_agent_install` only ever provides
+    # the one enabled `agent-harness:probe`, so the disabled-plugin exclusion below
+    # needs its own install.
     config = tmp_path / "claude-config"
-    installs = {}
-    for name in ("alpha", "beta"):
-        agents = tmp_path / "plugins" / name / "agents"
-        agents.mkdir(parents=True)
-        (agents / "helper.md").write_text(
-            f"---\nname: helper\ndescription: {name} helper\n---\nDo it.\n",
-            encoding="utf-8",
-        )
-        installs[f"{name}@mk"] = [
-            {"scope": "user", "installPath": str(tmp_path / "plugins" / name)}
-        ]
-    (config / "plugins").mkdir()
-    (config / "plugins" / "installed_plugins.json").write_text(
-        json.dumps({"version": 2, "plugins": installs}), encoding="utf-8"
+    beta_agents = tmp_path / "plugins" / "beta" / "agents"
+    beta_agents.mkdir(parents=True)
+    (beta_agents / "helper.md").write_text(
+        "---\nname: helper\ndescription: beta helper\n---\nDo it.\n", encoding="utf-8"
     )
-    (config / "settings.json").write_text(
-        json.dumps({"enabledPlugins": {"alpha@mk": True, "beta@mk": True}}), encoding="utf-8"
-    )
+    installed_path = config / "plugins" / "installed_plugins.json"
+    installed = json.loads(installed_path.read_text())
+    installed["plugins"]["beta@mk"] = [
+        {"scope": "user", "installPath": str(tmp_path / "plugins" / "beta")}
+    ]
+    installed_path.write_text(json.dumps(installed), encoding="utf-8")
+    settings_path = config / "settings.json"
+    settings = json.loads(settings_path.read_text())
+    settings["enabledPlugins"]["beta@mk"] = True
+    settings_path.write_text(json.dumps(settings), encoding="utf-8")
     (project_dir / ".claude" / "settings.local.json").write_text(
         json.dumps({"enabledPlugins": {"beta@mk": False}}), encoding="utf-8"
     )
@@ -607,10 +607,73 @@ def test_list_agents_uses_session_cwd_and_respects_disabled_plugins(
     by_name = {a["qualified_name"]: a for a in implicit[2]["agents"]}
     assert os.path.samefile(implicit[2]["cwd"], session_context["cwd"])
     assert by_name["demo"]["source_scope"] == "project"
-    assert by_name["alpha:helper"]["source_scope"] == "plugin"
+    assert by_name["agent-harness:probe"]["source_scope"] == "plugin"
     assert "beta:helper" not in by_name
     assert explicit[0] is False, explicit[1]
     assert os.path.samefile(explicit[2]["cwd"], tmp_path / "elsewhere")
+
+
+def test_plugin_agent_lists_and_starts_colon_qualified_with_tools(
+    server_params, plugin_agent_install, project_dir, argv_log
+):
+    """R1 (list half) + R2 (start half): a plugin `agents/` definition is discovered
+    as `<plugin>:<name>`, and dispatching it binds `tools:` as a real `--tools`
+    allowlist -- not just carried inside the `--agents` JSON payload, which is all
+    v0.0.4 did. The `--tools` assertion is the discriminator: it fails (absent from
+    argv) on v0.0.4 and passes on the pinned v0.0.5."""
+
+    async def scenario(session):
+        listed = await _call(session, "harness_list_agents", cwd=str(project_dir))
+        is_error, text, started = await _call(
+            session,
+            "harness_start_agent",
+            agent="agent-harness:probe",
+            cwd=str(project_dir),
+            model="sonnet",
+        )
+        assert not is_error, text
+        final = await _poll_until_terminal(session, started["run_id"])
+        return listed, started, final
+
+    listed, started, final = _run(scenario, server_params)
+
+    # R1 -- list half.
+    is_error, text, payload = listed
+    assert not is_error, text
+    by_name = {a["qualified_name"]: a for a in payload["agents"]}
+    assert "agent-harness:probe" in by_name
+    entry = by_name["agent-harness:probe"]
+    assert entry["source_scope"] == "plugin"
+    assert Path(entry["path"]) == plugin_agent_install / "agents" / "probe.md"
+
+    # R2 -- start half.
+    assert final["state"] == "COMPLETED"
+    assert final["text"] == "OK"
+    (record,) = _argv_records(argv_log)
+    assert _flag(record["argv"], "--agent") == "agent-harness:probe"
+    assert _flag(record["argv"], "--tools") == "Read,Glob"
+    assert _agents_payload(record)["agent-harness:probe"]["tools"] == ["Read", "Glob"]
+
+
+def test_project_agent_overrides_plugin_agent_by_qualified_name(
+    server_params, plugin_agent_install, project_dir
+):
+    """README override claim: a project-scope definition using the shipped plugin
+    agent's own qualified name (`name: agent-harness:probe`) wins over the plugin's,
+    per discovery's project > user > plugin precedence (first writer wins)."""
+    (project_dir / ".claude" / "agents" / "over.md").write_text(
+        "---\nname: agent-harness:probe\ndescription: Project override of the plugin probe\n---\n"
+        "Say OK.\n",
+        encoding="utf-8",
+    )
+
+    async def scenario(session):
+        return await _call(session, "harness_list_agents", cwd=str(project_dir))
+
+    is_error, text, payload = _run(scenario, server_params)
+    assert not is_error, text
+    by_name = {a["qualified_name"]: a for a in payload["agents"]}
+    assert by_name["agent-harness:probe"]["source_scope"] == "project"
 
 
 # --- harness_send_message (#5) ------------------------------------------------------

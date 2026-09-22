@@ -200,6 +200,13 @@ jobs:
           # hooks/ registers the session-context hook (plugin.json "hooks" key).
           cp -a stamped/hooks "$STAGE/"
           test -f "$STAGE/hooks/hooks.json"
+          # agents/ ships the plugin's standard agents (discovered by lib-python-harness
+          # as <plugin>:<name>). Hard-fail the release rather than silently skipping,
+          # unlike the [ -d ... ] && cp || true pattern used for optional dirs above.
+          if ! compgen -G "stamped/agents/*.md" >/dev/null; then
+            echo "::error::missing agents/*.md in stamped source"; exit 1
+          fi
+          cp -a stamped/agents "$STAGE/"
           # description.md ships onto the orphan release branch too, so the
           # dispatch payload's description_url
           # (raw.githubusercontent.com/${repo}/${TAG}/description.md) resolves.
