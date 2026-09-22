@@ -19,6 +19,7 @@ build = [
 ]
 test = [
   "pytest>=8",
+  "pytest-timeout>=2.3",
 ]
 
 [tool.setuptools]
@@ -34,3 +35,9 @@ addopts = "-ra --strict-markers -m 'not live'"
 markers = [
   "live: needs the real `claude` CLI; deselected by default, run with `python -m pytest -m live`",
 ]
+# thread-based timeout (not the "signal" default): signal-based timeouts don't
+# work on Windows and can't interrupt blocking I/O, thread-based can. A test
+# stuck in a stdio-pipe deadlock (ticket #25) is killed after 60s with a
+# stack trace instead of silently eating the whole CI job's timeout-minutes.
+timeout = 60
+timeout_method = "thread"

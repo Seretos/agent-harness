@@ -13,6 +13,7 @@ from test_mcp_tools import _call, _poll_until_terminal, _run
 pytestmark = pytest.mark.live
 
 
+@pytest.mark.timeout(300)  # exceeds the repo's global 60s default: real 240s poll budget below
 def test_live_start_agent_prompt_becomes_user_message(live_server_params, tmp_path):
     if shutil.which("claude") is None:
         pytest.skip("the real `claude` CLI is not on PATH")
@@ -277,6 +278,7 @@ def test_accepted_values_match_the_cli():
         _probe_cli_accepts("permission_mode", token)
 
 
+@pytest.mark.timeout(300)  # exceeds the repo's global 60s default: real 240s poll budget below
 def test_live_wait_run_timeout_keeps_run_alive(live_server_params):
     if shutil.which("claude") is None:
         pytest.skip("the real `claude` CLI is not on PATH")
