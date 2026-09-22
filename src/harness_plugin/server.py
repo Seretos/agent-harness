@@ -40,37 +40,40 @@ from harness_plugin.runs import (
 
 mcp = FastMCP("harness")
 
-# The real `claude` CLI's own accepted values for `--effort`, `--permission-mode`
-# and `--model` -- this repo's own enumeration, since upstream lib_python_harness
-# states no list for `permission_mode` and none of these are validated by this
-# plugin (see plan "Premises verified"/"The accepted values are enumerated and
-# owned by this repo"). Probed against the installed real `claude` CLI, v2.1.278
-# (`claude --help`; see tests/test_live_claude.py::test_accepted_values_match_
-# the_cli, R6, run 2026-09-22).
-#
-# `permission_mode`'s "default" is NOT among the tokens `--help` prints under
-# `--permission-mode`'s own "(choices: ...)" text (that list is acceptEdits,
-# auto, bypassPermissions, manual, dontAsk, plan) -- but it is nonetheless
-# genuinely accepted by the CLI, not invented or rejected: a real run started
-# with `--permission-mode default` completes, and its stream-json init event
-# reports the value straight back (`"permissionMode":"default"`), the same as
-# any other accepted mode; an actually-rejected value (verified the same way,
-# e.g. `notarealmode`) instead fails fast with `error: option '--permission-
-# mode <mode>' argument '...' is invalid.` before any child even starts. "default"
-# is kept here because it is real, not because `--help` lists it -- see the
-# change report for how this was probed and why the live R6 check's --help-text
-# scoping (a proxy for "real", not the CLI's full truth) cannot see this one
-# token on its own.
+# "Accepted" per value, from each value's own authority (plan "Who decides
+# accepted"), not this repo's own guess:
+# - effort/model are enumerated from the pinned lib_python_harness's own hard
+#   validator (providers/claude_cli.py's _EFFORT_VALUES/_MODEL_ALIASES), which
+#   raises UnsupportedByProvider before a child ever launches -- see
+#   tests/test_mcp_tools.py::test_documented_values_match_lib_validator.
+#   `inherit` is excluded from the model aliases: it is an agent-definition
+#   sentinel, not a CLI-accepted value (the lib's own comment, claude_cli.py:
+#   33-35). model's *last* tuple element is a full-model-id example, not an
+#   alias (see _MODEL_VALUES_TEXT's `[:-1]`/`[-1]` split below).
+# - permission_mode has no lib validator (claude_cli.py passes it straight
+#   through), so it is enumerated from the live `claude` CLI instead --
+#   tests/test_live_claude.py::test_accepted_values_match_the_cli. "default"
+#   is NOT among the tokens `--help` prints under `--permission-mode`'s own
+#   "(choices: ...)" text, but it is genuinely accepted by the CLI: a real run
+#   started with `--permission-mode default` completes, and its stream-json
+#   init event reports the value straight back (`"permissionMode":"default"`)
+#   -- probe-verified (_probe_cli_accepts), not just trusted from --help text.
 _ACCEPTED_VALUES: dict[str, tuple[str, ...]] = {
-    "effort": ("low", "medium", "high"),
-    "permission_mode": ("default", "acceptEdits", "plan", "bypassPermissions"),
-    "model": ("opus", "sonnet", "haiku", "claude-haiku-4-5-20251001"),
+    "effort": ("low", "medium", "high", "xhigh", "max"),
+    "permission_mode": (
+        "default", "acceptEdits", "auto", "bypassPermissions", "dontAsk", "manual", "plan",
+    ),
+    # Last element is a full-model-id *example*, not an accepted alias -- keep
+    # it last, _MODEL_VALUES_TEXT and test_documented_values_match_lib_validator
+    # both rely on that position (`[:-1]` for aliases, `[-1]` for the example).
+    "model": ("opus", "sonnet", "haiku", "fable", "default", "claude-haiku-4-5-20251001"),
 }
 
 _EFFORT_VALUES_TEXT = ", ".join(_ACCEPTED_VALUES["effort"])
 _MODEL_VALUES_TEXT = (
-    ", ".join(_ACCEPTED_VALUES["model"][:3])
-    + f", or a full model id such as {_ACCEPTED_VALUES['model'][3]}"
+    ", ".join(_ACCEPTED_VALUES["model"][:-1])
+    + ", or a full model id containing claude/anthropic/opus/sonnet/haiku/fable "
+    + f"(e.g. {_ACCEPTED_VALUES['model'][-1]}); anything else is refused before launch"
 )
 _PERMISSION_MODE_VALUES_TEXT = ", ".join(_ACCEPTED_VALUES["permission_mode"])
 

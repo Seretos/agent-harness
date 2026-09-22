@@ -117,6 +117,13 @@ def test_live_start_plugin_agent_colon_qualified(live_server_params, tmp_path):
 # what the app actually documents must fail this test on its own -- looping only
 # over _ACCEPTED_VALUES itself can't detect that, since an empty list makes the loop
 # body never run.
+#
+# Not redundant with the printed-vs-documented reverse check below: that check
+# can only ever compare against what --help actually prints, so it structurally
+# cannot notice "default" being dropped from _ACCEPTED_VALUES -- --help never
+# prints "default" in the first place (see server.py's _ACCEPTED_VALUES comment),
+# so there is nothing in `printed_permission_mode` for its absence to violate.
+# This fixed minimum is the only thing in this test that would catch that.
 _MIN_PERMISSION_MODE = {
     "default", "acceptEdits", "auto", "bypassPermissions", "dontAsk", "manual", "plan",
 }

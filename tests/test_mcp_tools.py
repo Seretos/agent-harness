@@ -216,6 +216,23 @@ def _assert_states_negatively(desc, token_re, label):
     )
 
 
+_COMMON_WORD_TOKENS = {"max", "default", "auto", "manual"}
+
+
+def _token_present(desc, token):
+    """Presence check for an accepted-value literal. Most tokens (`xhigh`,
+    `fable`, `dontAsk`, `acceptEdits`, ...) are distinctive enough that a bare
+    substring test only passes when the real literal is there. A handful of
+    common English words used as value literals (`max`, `default`, `auto`,
+    `manual`) are not: bare substring would also pass on unrelated prose like
+    "maximum", "defaults to...", "automatically" or "manually" without the
+    actual token being documented (test-critic tautology::F1). For those,
+    require a word-boundary match instead so only the literal itself counts."""
+    if token in _COMMON_WORD_TOKENS:
+        return re.search(rf"\b{re.escape(token)}\b", desc) is not None
+    return token in desc
+
+
 def test_start_tools_document_accepted_values(server_params):
     """R3: tools/list names the accepted values for model/effort/permission_mode, per
     tool. `harness_start_agent`'s inputSchema.properties for model, effort and
@@ -245,7 +262,7 @@ def test_start_tools_document_accepted_values(server_params):
     assert "low" in effort_desc and "medium" in effort_desc and "high" in effort_desc, (
         "harness_start_agent effort description must name low/medium/high"
     )
-    assert "xhigh" in effort_desc and "max" in effort_desc, (
+    assert "xhigh" in effort_desc and _token_present(effort_desc, "max"), (
         "harness_start_agent effort description must name xhigh/max"
     )
     assert "--effort" in effort_desc
@@ -260,7 +277,9 @@ def test_start_tools_document_accepted_values(server_params):
 
     model_desc = agent_props["model"].get("description") or ""
     for token in ("opus", "sonnet", "haiku", "fable", "default", "claude-"):
-        assert token in model_desc, f"harness_start_agent model description missing {token!r}"
+        assert _token_present(model_desc, token), (
+            f"harness_start_agent model description missing {token!r}"
+        )
     _assert_states_positively(
         model_desc, r"\bmodel\b", "harness_start_agent model description"
     )
@@ -275,7 +294,7 @@ def test_start_tools_document_accepted_values(server_params):
         "default", "acceptEdits", "auto", "bypassPermissions", "dontAsk", "manual",
         "plan", "inherit",
     ):
-        assert token in perm_desc, (
+        assert _token_present(perm_desc, token), (
             f"harness_start_agent permission_mode description missing {token!r}"
         )
     # Tightened per round-3 test-critic F1: bare presence of "inherit" would also
@@ -296,7 +315,7 @@ def test_start_tools_document_accepted_values(server_params):
     assert (
         "low" in prompt_effort_desc and "medium" in prompt_effort_desc and "high" in prompt_effort_desc
     ), "harness_start_prompt effort description must name low/medium/high"
-    assert "xhigh" in prompt_effort_desc and "max" in prompt_effort_desc, (
+    assert "xhigh" in prompt_effort_desc and _token_present(prompt_effort_desc, "max"), (
         "harness_start_prompt effort description must name xhigh/max"
     )
     # harness_start_prompt never reads parent-session context, so its unset
@@ -312,7 +331,9 @@ def test_start_tools_document_accepted_values(server_params):
 
     prompt_model_desc = prompt_props["model"].get("description") or ""
     for token in ("opus", "sonnet", "haiku", "fable", "default", "claude-"):
-        assert token in prompt_model_desc, f"harness_start_prompt model description missing {token!r}"
+        assert _token_present(prompt_model_desc, token), (
+            f"harness_start_prompt model description missing {token!r}"
+        )
     # Same asymmetry for model: harness_start_prompt has no session context to
     # fall back to, so the description must say the parameter is required
     # rather than describing a fallback target. Require a negated claim about
