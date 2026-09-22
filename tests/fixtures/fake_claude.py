@@ -15,12 +15,40 @@ A prompt containing `TOOL:<name>` emits one assistant `tool_use` event for that 
 after the init event (before any SLEEP), so a still-RUNNING run's last activity is that tool.
 A prompt containing `ECHO:<word>` is answered with `<word>` instead of `OK`. The session
 id is taken from `--session-id <id>` or, for a resumed run, `--resume <id>`.
+A prompt containing `NO_INIT_NAMES` suppresses `INIT_ANNOUNCEMENTS` from the init event
+(a bare `{"type": "system", "subtype": "init", ...}`), so a test can exercise
+`harness_inspect_run`'s argv-derived `requested.*` fallback independently of what the
+init event announces.
+A prompt containing `ALT_INIT_SHAPE` emits the init event's mcp-server list under the
+`mcpServers` alias key (instead of the primary `mcp_servers` spelling) and its tools list
+as dict-shaped items (`{"name": ...}`) instead of plain strings, so a test can exercise
+`harness_inspect_run`'s `_INIT_NAME_FIELDS` alias lookup and `_names()`'s dict branch,
+neither of which `INIT_ANNOUNCEMENTS`'s plain-string/primary-key shape reaches.
 """
 import json
 import os
 import re
 import sys
 import time
+
+# Fixed name lists the init event announces, keyed to match `_INIT_NAME_FIELDS`'s
+# primary spelling (`mcp_servers`, `tools`, `skills`, `agents`) so a test can assert
+# `harness_inspect_run`'s `announced.*` against this constant instead of a literal.
+INIT_ANNOUNCEMENTS: dict[str, list[str]] = {
+    "mcp_servers": ["alpha-server", "beta-server"],
+    "tools": ["Read", "Bash", "Write"],
+    "skills": ["skill-one", "skill-two", "skill-three"],
+    "agents": ["agent-x", "agent-y"],
+}
+
+# Marker checked against the prompt (stdin) to suppress INIT_ANNOUNCEMENTS above.
+NO_INIT_NAMES = "NO_INIT_NAMES"
+
+# Marker checked against the prompt (stdin): switches the init event to the alias-key /
+# dict-item shape below instead of INIT_ANNOUNCEMENTS's primary-key / plain-string shape.
+ALT_INIT_SHAPE = "ALT_INIT_SHAPE"
+ALT_INIT_MCP_SERVERS: list[str] = ["alias-server"]
+ALT_INIT_TOOLS: list[str] = ["AliasTool"]
 
 
 def main() -> int:
@@ -41,7 +69,13 @@ def main() -> int:
 
     prompt = sys.stdin.read()
     match = re.search(r"SLEEP:(\d+(?:\.\d+)?)", prompt)
-    print(json.dumps({"type": "system", "subtype": "init", "session_id": session_id}), flush=True)
+    init_event = {"type": "system", "subtype": "init", "session_id": session_id}
+    if ALT_INIT_SHAPE in prompt:
+        init_event["mcpServers"] = ALT_INIT_MCP_SERVERS
+        init_event["tools"] = [{"name": name} for name in ALT_INIT_TOOLS]
+    elif NO_INIT_NAMES not in prompt:
+        init_event.update(INIT_ANNOUNCEMENTS)
+    print(json.dumps(init_event), flush=True)
     tool = re.search(r"TOOL:(\w+)", prompt)
     if tool:
         print(

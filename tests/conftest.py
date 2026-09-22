@@ -99,10 +99,35 @@ def project_dir(tmp_path) -> Path:
     agents = tmp_path / "project" / ".claude" / "agents"
     agents.mkdir(parents=True)
     (agents / "demo.md").write_text(
-        "---\nname: demo\ndescription: Demo agent for tests\n---\nSay OK.\n",
+        "---\nname: demo\ndescription: Demo agent for tests\n"
+        "skills: [demo-skill-a, demo-skill-b]\n---\nSay OK.\n",
         encoding="utf-8",
     )
     return tmp_path / "project"
+
+
+@pytest.fixture
+def mcp_agent_project(tmp_path) -> Path:
+    """A project cwd with one agent definition, `mcp-agent`, whose frontmatter sets
+    `mcpServers:` — a key the `--agents` JSON schema rejects (`AGENT_JSON_KEYS`), so
+    dispatching it always takes the materialized `.claude/agents/<stem>.md` carrier
+    (`claude_cli.py:117-146`) — the only way `harness_inspect_run`'s system-prompt
+    resolution reaches its `"materialized:<path>"` branch, and the only carrier that
+    also always emits `--mcp-config` regardless of payload/materialized routing."""
+    agents = tmp_path / "mcp-agent-project" / ".claude" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "mcp-agent.md").write_text(
+        "---\n"
+        "name: mcp-agent\n"
+        "description: Agent requiring the materialized dispatch carrier\n"
+        "mcpServers:\n"
+        "  demo-server:\n"
+        "    command: demo\n"
+        "---\n"
+        "Materialized agent body for inspection tests.\n",
+        encoding="utf-8",
+    )
+    return tmp_path / "mcp-agent-project"
 
 
 @pytest.fixture

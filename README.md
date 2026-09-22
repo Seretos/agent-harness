@@ -56,6 +56,8 @@ harness wait <run_id> [--timeout <seconds>] [--interval <seconds>]
 
 `harness_list_runs` lists all recorded runs as compact rows (`run_id`, `state`, `model`, `cwd`, `created_at`, `label`; no text or usage) so a lost `run_id` can be found again; `harness_start_prompt`/`harness_start_agent` accept an optional `label`, `harness_start_agent` also accepts an optional `prompt` (the run's task / user message; the agent definition's body stays its system prompt), and `harness_poll_run` reports `event_count`/`last_event_at` while a run is RUNNING.
 
+`harness_inspect_run(run_id)` answers, for one run, what it announced (`announced.{mcp_servers,tools,skills,agents}`, from its own `events.jsonl` init event, plus `announced_counts` and the raw `init_event`), what the harness itself requested (`requested.{mcp_servers,tools,skills,agents}`, from the run's own recorded argv, populated even when the init event announced nothing), and the exact `system_prompt` text actually sent (`text`, `source`, `chars`, `sha256`, `recorded_sha256`) — so a harness-vs-native discrepancy can be diagnosed without hand-reading a Claude transcript. Works on a still-RUNNING run.
+
 `harness_send_message(run_id, prompt)` sends a follow-up to a **finished** run: it resumes the origin's session (keeping its isolation) and returns a new RUNNING run with its own `run_id`; then use `harness_wait_run` or `harness_poll_run` on it.
 
 It prints one `harness_poll_run`-shaped JSON object plus `waited_s` on stdout and never cancels the run. Without `--timeout` it blocks until the run ends; `--interval` defaults to 2 (minimum 0.2).

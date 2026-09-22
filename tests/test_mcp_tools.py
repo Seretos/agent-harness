@@ -1,5 +1,6 @@
 """MCP-level tests: a real `python -m harness_plugin` server over stdio,
 talking to the fake claude CLI from tests/fixtures/fake_claude.py."""
+import hashlib
 import json
 import os
 import re
@@ -11,6 +12,13 @@ from pathlib import Path
 import anyio
 import pytest
 from conftest import SESSION_ID, plant_session_file
+from fixtures.fake_claude import (
+    ALT_INIT_MCP_SERVERS,
+    ALT_INIT_SHAPE,
+    ALT_INIT_TOOLS,
+    INIT_ANNOUNCEMENTS,
+    NO_INIT_NAMES,
+)
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client
 
@@ -24,6 +32,7 @@ EXPECTED_TOOLS = {
     "harness_stop_run",
     "harness_cleanup_run",
     "harness_send_message",
+    "harness_inspect_run",
 }
 TERMINAL = {"COMPLETED", "FAILED", "CANCELLED"}
 
@@ -711,3 +720,322 @@ def test_start_agent_refuses_blank_prompt_without_spawning(
     assert is_error
     assert "empty" in text.lower()
     assert not argv_log.exists() or not _argv_records(argv_log)
+
+
+# --- harness_inspect_run (#28) ------------------------------------------------------
+
+
+async def _poll_until_activity(session, run_id, activity, budget=20.0):
+    deadline = time.monotonic() + budget
+    while True:
+        is_error, text, payload = await _call(session, "harness_poll_run", run_id=run_id)
+        assert not is_error, text
+        if payload.get("last_activity") == activity:
+            return payload
+        assert time.monotonic() < deadline, f"never reached last_activity={activity!r}: {payload}"
+        await anyio.sleep(0.2)
+
+
+def test_inspect_run_returns_announced_names_from_init_event(server_params):
+    async def scenario(session):
+        is_error, text, started = await _call(
+            session, "harness_start_prompt", prompt="Say OK.", model="sonnet"
+        )
+        assert not is_error, text
+        final = await _poll_until_terminal(session, started["run_id"])
+        inspected = await _call(session, "harness_inspect_run", run_id=started["run_id"])
+        return final, inspected
+
+    final, (is_error, text, payload) = _run(scenario, server_params)
+    assert not is_error, text
+    announced = payload["announced"]
+    for key, names in INIT_ANNOUNCEMENTS.items():
+        assert announced[key] == names, key
+    assert payload["announced_counts"] == {
+        key: len(names) for key, names in INIT_ANNOUNCEMENTS.items()
+    }
+    # Verbatim passthrough: the *whole* init event, not just its session_id, must match
+    # what the fake CLI actually emitted -- a filtered/synthesised copy carrying only the
+    # recognised keys plus session_id would fail this.
+    assert payload["init_event"] == {
+        "type": "system",
+        "subtype": "init",
+        "session_id": final["session_id"],
+        **INIT_ANNOUNCEMENTS,
+    }
+    # A terminal run's `state` must reflect the real run state, not a literal.
+    assert payload["state"] == final["state"] == "COMPLETED"
+
+
+def test_inspect_run_announced_names_handle_alias_key_and_dict_items(server_params):
+    """`_INIT_NAME_FIELDS`'s `mcpServers` alias and `_names()`'s dict-item branch
+    (`{"name": ...}`) are never reached by the plain-string/primary-key fixture above --
+    this exercises both explicitly."""
+
+    async def scenario(session):
+        is_error, text, started = await _call(
+            session, "harness_start_prompt", prompt=f"{ALT_INIT_SHAPE} Say OK.", model="sonnet"
+        )
+        assert not is_error, text
+        await _poll_until_terminal(session, started["run_id"])
+        return await _call(session, "harness_inspect_run", run_id=started["run_id"])
+
+    is_error, text, payload = _run(scenario, server_params)
+    assert not is_error, text
+    announced = payload["announced"]
+    assert announced["mcp_servers"] == ALT_INIT_MCP_SERVERS, (
+        "the mcpServers alias key must be recognised, not just mcp_servers"
+    )
+    assert announced["tools"] == ALT_INIT_TOOLS, (
+        "dict-shaped announcement items ({'name': ...}) must resolve via item['name']"
+    )
+
+
+def test_inspect_run_reports_requested_names_from_argv(
+    server_params, project_dir, mcp_agent_project, argv_log
+):
+    async def scenario(session):
+        is_error, text, started = await _call(
+            session,
+            "harness_start_agent",
+            agent="mcp-agent",
+            cwd=str(mcp_agent_project),
+            model="sonnet",
+        )
+        assert not is_error, text
+        await _poll_until_terminal(session, started["run_id"])
+        inspected = await _call(session, "harness_inspect_run", run_id=started["run_id"])
+
+        # Second case: the fake CLI's init event announces nothing (NO_INIT_NAMES in the
+        # task/stdin), so `requested.agents` must still come from this run's own argv —
+        # the fallback the frame demands, independent of what the init event announced.
+        is_error2, text2, started2 = await _call(
+            session,
+            "harness_start_agent",
+            agent="mcp-agent",
+            cwd=str(mcp_agent_project),
+            model="sonnet",
+            prompt=f"{NO_INIT_NAMES} Say OK.",
+        )
+        assert not is_error2, text2
+        await _poll_until_terminal(session, started2["run_id"])
+        inspected2 = await _call(session, "harness_inspect_run", run_id=started2["run_id"])
+
+        # Third case: a payload-carrier dispatch (`demo`, no mcpServers/hooks) is the
+        # only carrier whose `--agents` JSON can carry a `skills` field at all -- the
+        # `mcp-agent` runs above always take the materialized carrier (they set
+        # mcpServers), which never emits `--agents`.
+        is_error3, text3, started3 = await _call(
+            session, "harness_start_agent", agent="demo", cwd=str(project_dir), model="sonnet"
+        )
+        assert not is_error3, text3
+        await _poll_until_terminal(session, started3["run_id"])
+        inspected3 = await _call(session, "harness_inspect_run", run_id=started3["run_id"])
+        return inspected, inspected2, inspected3
+
+    (is_error, text, payload), (is_error2, text2, payload2), (is_error3, text3, payload3) = _run(
+        scenario, server_params
+    )
+    assert not is_error, text
+    assert not is_error2, text2
+    assert not is_error3, text3
+
+    records = _argv_records(argv_log)
+    record = records[0]
+    requested = payload["requested"]
+    assert "mcp-agent" in requested["agents"]
+
+    mcp_config = json.loads(_flag(record["argv"], "--mcp-config"))
+    assert requested["mcp_servers"] == list(mcp_config["mcpServers"].keys())
+
+    # This fixture's dispatch never sets session tools (no `.seretos/harness.yml`
+    # override in play), so `--tools` is reliably absent from this run's argv --
+    # asserted explicitly so the test cannot pass regardless of which branch a stub
+    # implementation takes.
+    assert "--tools" not in record["argv"], (
+        "this fixture's dispatch does not set session tools; if that changes, the "
+        "--tools-present branch needs its own coverage"
+    )
+    assert requested["tools"] == []
+
+    # Second case: init event announced nothing, but the argv-derived fallback still is.
+    assert payload2["announced"]["skills"] == []
+    assert payload2["announced_counts"] == {
+        "mcp_servers": 0, "tools": 0, "skills": 0, "agents": 0,
+    }, "announced_counts must track the actually-parsed (empty) announced lists"
+    assert payload2["requested"]["agents"], (
+        "requested.agents must fall back to argv even when the init event announces "
+        "nothing"
+    )
+
+    # Third case: requested.skills, from the --agents payload's own "skills" key.
+    demo_record = records[2]
+    demo_payload = _agents_payload(demo_record)["demo"]
+    assert demo_payload.get("skills"), "fixture bug: demo.md must declare skills"
+    assert payload3["requested"]["skills"] == demo_payload["skills"]
+
+
+def test_inspect_run_requested_defaults_to_empty_lists_for_clean_run(server_params):
+    async def scenario(session):
+        is_error, text, started = await _call(
+            session, "harness_start_prompt", prompt="Say OK.", model="sonnet"
+        )
+        assert not is_error, text
+        await _poll_until_terminal(session, started["run_id"])
+        return await _call(session, "harness_inspect_run", run_id=started["run_id"])
+
+    is_error, text, payload = _run(scenario, server_params)
+    assert not is_error, text
+    requested = payload["requested"]
+    assert requested["agents"] == [], "absence must be a list, never null"
+    assert requested["mcp_servers"] == [], "absence must be a list, never null"
+
+
+def test_inspect_run_returns_system_prompt_text_per_carrier(
+    server_params, project_dir, mcp_agent_project, argv_log, tmp_path
+):
+    marker = "System prompt marker for R3 case A"
+
+    async def scenario(session):
+        is_error_a, text_a, started_a = await _call(
+            session,
+            "harness_start_prompt",
+            prompt="Say OK.",
+            model="sonnet",
+            system_prompt=marker,
+        )
+        assert not is_error_a, text_a
+        await _poll_until_terminal(session, started_a["run_id"])
+        inspected_a = await _call(session, "harness_inspect_run", run_id=started_a["run_id"])
+
+        is_error_b, text_b, started_b = await _call(
+            session,
+            "harness_start_agent",
+            agent="demo",
+            cwd=str(project_dir),
+            model="sonnet",
+        )
+        assert not is_error_b, text_b
+        await _poll_until_terminal(session, started_b["run_id"])
+        inspected_b = await _call(session, "harness_inspect_run", run_id=started_b["run_id"])
+
+        is_error_c, text_c, started_c = await _call(
+            session,
+            "harness_start_agent",
+            agent="mcp-agent",
+            cwd=str(mcp_agent_project),
+            model="sonnet",
+        )
+        assert not is_error_c, text_c
+        await _poll_until_terminal(session, started_c["run_id"])
+        inspected_c = await _call(session, "harness_inspect_run", run_id=started_c["run_id"])
+
+        return started_c, inspected_a, inspected_b, inspected_c
+
+    started_c, (ea, ta, payload_a), (eb, tb, payload_b), (ec, tc, payload_c) = _run(
+        scenario, server_params
+    )
+    assert not ea, ta
+    assert not eb, tb
+    assert not ec, tc
+
+    records = _argv_records(argv_log)
+    record_a, record_b = records[0], records[1]
+
+    # (a) --system-prompt carrier
+    sp_a = payload_a["system_prompt"]
+    assert sp_a["text"] == _flag(record_a["argv"], "--system-prompt")
+    assert sp_a["source"] == "--system-prompt"
+    assert sp_a["chars"] == len(sp_a["text"])
+    # Anchored to a digest computed independently of the production code path (not just
+    # cross-checked against recorded_sha256, which a copy-both-fields stub would also
+    # satisfy).
+    assert sp_a["sha256"] == hashlib.sha256(sp_a["text"].encode("utf-8")).hexdigest()
+    assert sp_a["sha256"] == sp_a["recorded_sha256"]
+
+    # (b) --agents payload carrier
+    sp_b = payload_b["system_prompt"]
+    assert sp_b["text"] == _agents_payload(record_b)["demo"]["prompt"]
+    assert sp_b["source"] == "--agents"
+    assert sp_b["chars"] == len(sp_b["text"])
+    assert sp_b["sha256"] == sp_b["recorded_sha256"]
+
+    # (c) materialized carrier
+    sp_c = payload_c["system_prompt"]
+    materialized_path = (
+        tmp_path
+        / "artifacts"
+        / started_c["run_id"]
+        / "agents"
+        / ".claude"
+        / "agents"
+        / "mcp-agent.md"
+    )
+    assert materialized_path.exists(), "fixture bug: materialized agent file missing"
+    # Anchored to the fixture's own known literal body (conftest.py's mcp_agent_project),
+    # not to a formula that mirrors the implementation's own frontmatter-stripping
+    # expression -- that would only prove the implementation agrees with itself.
+    assert sp_c["text"] == "Materialized agent body for inspection tests.\n"
+    # The path half of the label matters, not just the "materialized:" prefix: it must
+    # name *this* run's own materialized file.
+    assert sp_c["source"] == f"materialized:{materialized_path}"
+    assert sp_c["chars"] == len(sp_c["text"])
+    assert sp_c["sha256"] == sp_c["recorded_sha256"]
+
+
+def test_inspect_run_system_prompt_empty_but_sent_is_empty_string_not_null(server_params):
+    async def scenario(session):
+        is_error, text, started = await _call(
+            session, "harness_start_prompt", prompt="Say OK.", model="sonnet"
+        )
+        assert not is_error, text
+        await _poll_until_terminal(session, started["run_id"])
+        return await _call(session, "harness_inspect_run", run_id=started["run_id"])
+
+    is_error, text, payload = _run(scenario, server_params)
+    assert not is_error, text
+    sp = payload["system_prompt"]
+    assert sp["text"] == ""
+    assert sp["chars"] == 0
+
+
+def test_inspect_run_while_running_and_error_paths(server_params):
+    async def scenario(session):
+        is_error, text, started = await _call(
+            session, "harness_start_prompt", prompt="SLEEP:30", model="sonnet"
+        )
+        assert not is_error, text
+        run_id = started["run_id"]
+        await _poll_until_activity(session, run_id, "init")
+        inspected_running = await _call(session, "harness_inspect_run", run_id=run_id)
+        await _call(session, "harness_stop_run", run_id=run_id)
+
+        unknown = await _call(session, "harness_inspect_run", run_id="does-not-exist")
+
+        is_error3, text3, quick = await _call(
+            session, "harness_start_prompt", prompt="Say OK.", model="sonnet"
+        )
+        assert not is_error3, text3
+        await _poll_until_terminal(session, quick["run_id"])
+        await _call(session, "harness_cleanup_run", run_id=quick["run_id"])
+        cleaned = await _call(session, "harness_inspect_run", run_id=quick["run_id"])
+
+        alive = await _call(session, "harness_list_runs")
+        return inspected_running, unknown, cleaned, alive
+
+    inspected_running, unknown, cleaned, alive = _run(scenario, server_params)
+
+    is_error, text, payload = inspected_running
+    assert not is_error, text
+    assert payload["state"] == "RUNNING"
+    announced = payload["announced"]
+    for key, names in INIT_ANNOUNCEMENTS.items():
+        assert announced[key] == names, key
+
+    assert unknown[0] is True
+    assert "HarnessError" in unknown[1]
+
+    assert cleaned[0] is True
+    assert "HarnessError" in cleaned[1]
+
+    assert alive[0] is False, alive[1]

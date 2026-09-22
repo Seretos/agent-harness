@@ -3,15 +3,210 @@
 Deliberately free of mcp/FastMCP imports: the subcommand must start without them."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from lib_python_harness import FileRunStore, Harness
+from lib_python_harness import FileRunStore, Harness, HarnessError
 
 _HARNESS: Harness | None = None
+
+# Init-event key(s) each announced category may be spelled under, primary spelling
+# first. NOTE: only `mcp_servers` carries a known alternate spelling (`mcpServers`) --
+# a differently-spelled real key for `tools`/`skills`/`agents` is indistinguishable
+# from genuine absence (the init event simply omits that key). Known, accepted
+# limitation (see the plan's "premises verified"), not a bug to fix here.
+_INIT_NAME_FIELDS: dict[str, tuple[str, ...]] = {
+    "mcp_servers": ("mcp_servers", "mcpServers"),
+    "tools": ("tools",),
+    "skills": ("skills",),
+    "agents": ("agents",),
+}
+
+
+def _names(item: Any) -> Any:
+    """One item of an init-event announcement list: a plain string is itself; a
+    dict-shaped item (e.g. `{"name": "Foo", ...}`) yields `item["name"]`."""
+    if isinstance(item, dict):
+        return item.get("name")
+    return item
+
+
+def _announced_names(init_event: dict[str, Any] | None, key: str) -> list[str]:
+    if init_event is None:
+        return []
+    for alias in _INIT_NAME_FIELDS[key]:
+        if alias in init_event:
+            raw = init_event[alias]
+            if not isinstance(raw, list):
+                return []
+            return [name for name in (_names(item) for item in raw) if name is not None]
+    return []
+
+
+def _read_init_event(events_path: str | Path | None) -> dict[str, Any] | None:
+    """The first `{"type": "system", "subtype": "init"}` line of `events_path`, or
+    `None` if the file is missing, empty, or has no such line (yet -- a still-RUNNING
+    run's init line may simply not have been written when this is called, though in
+    practice it is emitted before anything else)."""
+    if not events_path:
+        return None
+    path = Path(events_path)
+    if not path.exists():
+        return None
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "system" and event.get("subtype") == "init":
+            return event
+    return None
+
+
+def _flag(argv: list[str], name: str) -> str | None:
+    """The token immediately following `name` in `argv`, or `None` if `name` is
+    absent (or is the last token, which never happens for a real flag/value pair)."""
+    if name not in argv:
+        return None
+    idx = argv.index(name)
+    if idx + 1 >= len(argv):
+        return None
+    return argv[idx + 1]
+
+
+def _dedup(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def _requested_names(argv: list[str]) -> dict[str, list[str]]:
+    """What the harness itself asked for, read back from this run's own recorded argv
+    -- independent of what the init event announced (see module docstring / plan): the
+    `--agents` JSON's keys and each entry's own `skills`, the `--agent` value, the
+    `--mcp-config` JSON's `mcpServers` keys, and the `--tools` CSV."""
+    agents: list[str] = []
+    skills: list[str] = []
+    agents_json = _flag(argv, "--agents")
+    if agents_json:
+        try:
+            payload = json.loads(agents_json)
+        except json.JSONDecodeError:
+            payload = {}
+        for name, fields in payload.items():
+            agents.append(name)
+            if isinstance(fields, dict):
+                skills.extend(fields.get("skills") or [])
+    agent_flag = _flag(argv, "--agent")
+    if agent_flag:
+        agents.append(agent_flag)
+
+    mcp_servers: list[str] = []
+    mcp_config = _flag(argv, "--mcp-config")
+    if mcp_config:
+        try:
+            parsed = json.loads(mcp_config)
+        except json.JSONDecodeError:
+            parsed = {}
+        mcp_servers = list((parsed.get("mcpServers") or {}).keys())
+
+    tools: list[str] = []
+    tools_flag = _flag(argv, "--tools")
+    if tools_flag is not None:
+        tools = [t for t in tools_flag.split(",") if t]
+
+    return {
+        "agents": _dedup(agents),
+        "skills": _dedup(skills),
+        "mcp_servers": mcp_servers,
+        "tools": tools,
+    }
+
+
+def _resolve_system_prompt(record: dict[str, Any], argv: list[str]) -> dict[str, Any]:
+    """The exact system-prompt text this plugin sent, for whichever of the three
+    mutually-exclusive carriers this run used (see plan Approach): `--system-prompt`
+    (CLEAN runs), the `--agents` payload's `prompt` key, or the materialized
+    `<run_dir>/agents/.claude/agents/<stem>.md` file's body (frontmatter stripped).
+    `recorded_sha256` is the record's own `system_prompt_sha256` -- computed by the
+    library from the same body for all three carriers -- so it and the freshly
+    computed `sha256` prove the returned text is the text the run actually started
+    with."""
+    text: str | None = None
+    source: str | None = None
+
+    sp_flag = _flag(argv, "--system-prompt")
+    if sp_flag is not None:
+        text, source = sp_flag, "--system-prompt"
+    else:
+        agent_flag = _flag(argv, "--agent")
+        agents_json = _flag(argv, "--agents")
+        if agent_flag and agents_json:
+            try:
+                payload = json.loads(agents_json)
+            except json.JSONDecodeError:
+                payload = {}
+            agent_payload = payload.get(agent_flag)
+            if isinstance(agent_payload, dict) and "prompt" in agent_payload:
+                text, source = agent_payload["prompt"], "--agents"
+        if text is None and agent_flag and record.get("run_dir"):
+            materialized_path = (
+                Path(record["run_dir"]) / "agents" / ".claude" / "agents" / f"{agent_flag}.md"
+            )
+            if materialized_path.exists():
+                raw = materialized_path.read_text(encoding="utf-8")
+                body = raw.split("---", 2)[-1].lstrip("\n") if raw.startswith("---") else raw
+                text, source = body, f"materialized:{materialized_path}"
+
+    chars = len(text) if text is not None else 0
+    sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest() if text is not None else None
+
+    return {
+        "text": text,
+        "source": source,
+        "chars": chars,
+        "sha256": sha256,
+        "recorded_sha256": record.get("system_prompt_sha256"),
+    }
+
+
+def inspect_run(run_id: str) -> dict[str, Any]:
+    """What a single run announced, requested, and used as its system prompt -- see
+    `harness_inspect_run`'s docstring in `server.py` for the answer shape. Works on a
+    still-RUNNING run; an unknown or cleaned-up `run_id` raises `HarnessError`."""
+    h = harness()
+    record = h.store.get(run_id)
+    if record is None:
+        raise HarnessError(f"unknown run_id: {run_id}")
+
+    init_event = _read_init_event(record.get("events_path"))
+    announced = {key: _announced_names(init_event, key) for key in _INIT_NAME_FIELDS}
+    announced_counts = {key: len(names) for key, names in announced.items()}
+
+    argv = record.get("argv") or []
+    requested = _requested_names(argv)
+    system_prompt = _resolve_system_prompt(record, argv)
+
+    return {
+        "run_id": run_id,
+        "state": jsonable(record.get("state")),
+        "announced": announced,
+        "announced_counts": announced_counts,
+        "requested": requested,
+        "init_event": init_event,
+        "system_prompt": system_prompt,
+    }
 
 
 def artifacts_root() -> Path:
