@@ -41,3 +41,11 @@ markers = [
 # stack trace instead of silently eating the whole CI job's timeout-minutes.
 timeout = 60
 timeout_method = "thread"
+# faulthandler_timeout (pytest's builtin faulthandler plugin, ini-option only
+# -- there is no `--faulthandler-timeout` CLI flag) fires 10s before the
+# timeout above: it dumps every thread's Python frame stack to the log via
+# introspection, which works even when the blocked thread is stuck inside a
+# syscall and never returns control to the interpreter -- unlike
+# timeout_method="thread" above, which needs the interpreter to run a
+# bytecode instruction to notice the interrupt at all.
+faulthandler_timeout = 50
