@@ -709,6 +709,26 @@ def _flag(argv, name):
     return argv[argv.index(name) + 1]
 
 
+# Flags whose value is expected to vary run-to-run for reasons that have nothing to do
+# with what the plugin's own launch decided: `--session-id` (a fresh id every run) and
+# `--add-dir` (the materialized carrier's own `<run_dir>/agents` path, which embeds
+# this run's run_id -- see `claude_cli.py`'s `_build_inherit_plan`). Masking exactly
+# these two, and nothing else, is what makes three identical dispatches produce
+# byte-identical normalized argvs (#27 R1) -- any other divergence is a real one.
+_ARGV_RUN_VARYING_FLAGS = ("--session-id", "--add-dir")
+
+
+def _normalized_argv(argv):
+    """`argv` with the value token following each of `_ARGV_RUN_VARYING_FLAGS`
+    replaced by a fixed placeholder, so argv from separate runs of the same dispatch
+    can be compared for equality regardless of their own run-identity."""
+    out = list(argv)
+    for flag in _ARGV_RUN_VARYING_FLAGS:
+        if flag in out:
+            out[out.index(flag) + 1] = f"<{flag.lstrip('-')}>"
+    return out
+
+
 def _start_and_finish(params, **arguments):
     async def scenario(session):
         is_error, text, started = await _call(session, "harness_start_agent", **arguments)
@@ -734,6 +754,51 @@ def _poll_from_fresh_process(params, run_id):
         return polled[2]
 
     return _run(scenario, params)
+
+
+# --- launch determinism across repeated identical dispatches (#27 R1) -------------
+
+
+@pytest.mark.parametrize("carrier", ["demo", "mcp-agent"])
+def test_start_agent_repeated_launch_argv_is_identical(
+    server_params, project_dir, mcp_agent_project, argv_log, carrier
+):
+    """R1 (#27): identical `harness_start_agent` calls must yield identical argv/cwd,
+    modulo this run's own run_id/session_id -- for both dispatch carriers, the
+    `--agents`-JSON payload one (`demo`) and the materialized one (`mcp-agent`, which
+    also always emits `--mcp-config`). This is a pinning test: nothing in this repo's
+    own launch varies between runs (see plan #27 "premises verified" -- the CLI builds
+    the run-varying MCP-server announcement itself, downstream and outside this
+    plugin's control), so there is no red case to demonstrate here; the driving
+    assertion is that the CLI actually received a distinct `--session-id` each time
+    while everything else this plugin decided stayed byte-for-byte the same."""
+    cwd = project_dir if carrier == "demo" else mcp_agent_project
+
+    session_ids = []
+    for _ in range(3):
+        started, final = _start_and_finish(
+            server_params, agent=carrier, cwd=str(cwd), model="sonnet"
+        )
+        assert final["state"] == "COMPLETED", final
+        session_ids.append(final["session_id"])
+
+    records = _argv_records(argv_log)
+    assert len(records) == 3
+    assert len(set(session_ids)) == 3, "each run must get its own distinct session id"
+
+    normalized = [_normalized_argv(r["argv"]) for r in records]
+    assert normalized[0] == normalized[1] == normalized[2], normalized
+    cwds = [r["cwd"] for r in records]
+    assert cwds[0] == cwds[1] == cwds[2], cwds
+
+    for record in records:
+        assert _flag(record["argv"], "--setting-sources") == "user,project,local"
+        assert "--strict-mcp-config" not in record["argv"]
+
+    if carrier == "mcp-agent":
+        for record in records:
+            mcp_config = json.loads(_flag(record["argv"], "--mcp-config"))
+            assert mcp_config == {"mcpServers": {"demo-server": {"command": "demo"}}}
 
 
 def test_start_agent_inherits_session_context(server_params, session_context, argv_log):

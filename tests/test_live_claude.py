@@ -278,6 +278,172 @@ def test_accepted_values_match_the_cli():
         _probe_cli_accepts("permission_mode", token)
 
 
+# --- MCP-server announcement stability across repeated runs (#27 R2) --------------
+
+# Sub-fields of a `deferred_tools_delta` attachment `_first_turn_announcement` folds
+# into diagnostic-only sets, in addition to `pendingMcpServers` (the one the test
+# actually asserts empty). Real shape read straight from an actual evidence-run
+# transcript (`~/.agent-harness/runs/e3a7c89a-...`, CLI 2.1.278/2.1.280): a transcript
+# line `{"type": "attachment", "attachment": {"type": "deferred_tools_delta",
+# "addedNames": [...], "removedNames": [...], "pendingMcpServers": [...],
+# "needsAuthMcpServers": [...], "failedMcpServers": [...], ...}}`.
+_DEFERRED_DELTA_DIAGNOSTIC_FIELDS = {
+    "pending": "pendingMcpServers",
+    "needs_auth": "needsAuthMcpServers",
+    "failed": "failedMcpServers",
+}
+
+
+def _first_turn_announcement(transcript_path):
+    """Ground truth for what a run's *first turn* actually told the model about MCP
+    servers -- not the CLI's `system/init` event, which announces server *connection*
+    status at process start, not the deferred-tools mechanism's own turn-by-turn
+    surface to the model (plan #27 "premises verified": a real run's init event
+    listed servers `connected` while the transcript's first delta still had them in
+    `pendingMcpServers`; tools for those servers only arrived in a *later* delta).
+    Reads `transcript_path`'s JSONL up to (not including) its first
+    `{"type": "assistant"}` entry, and folds every `{"type": "attachment",
+    "attachment": {"type": "deferred_tools_delta", ...}}` entry seen in that window:
+    `addedNames` accumulate, `removedNames` retract.
+
+    Returns `(found_delta, servers, pending, needs_auth, failed)`:
+    - `found_delta`: whether at least one such entry was seen before the first
+      assistant turn. False means this test's ground-truth mechanism itself broke
+      (the CLI changed its transcript format) -- a hard failure, never a skip, since a
+      skip here would silently hide a real disagreement just as easily as a genuine
+      "nothing to test" case.
+    - `servers`: the MCP-server identifiers folded out of every surviving
+      `mcp__`-prefixed name in `addedNames` (`name.split("__", 2)[1]`, e.g.
+      `mcp__plugin_agent-comfy_comfy__list_models` -> `plugin_agent-comfy_comfy`) --
+      the actual equality-across-runs assertion target.
+    - `pending`/`needs_auth`/`failed`: the union, across every delta in the window, of
+      that delta's own `pendingMcpServers`/`needsAuthMcpServers`/`failedMcpServers`.
+      `pending` is asserted empty (nothing still connecting when the model's first
+      turn happened); the other two are diagnostics only, never asserted.
+    """
+    added_names: set[str] = set()
+    diag: dict[str, set[str]] = {key: set() for key in _DEFERRED_DELTA_DIAGNOSTIC_FIELDS}
+    found_delta = False
+    with open(transcript_path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            if entry.get("type") == "assistant":
+                break
+            if entry.get("type") != "attachment":
+                continue
+            attachment = entry.get("attachment")
+            if not isinstance(attachment, dict) or attachment.get("type") != "deferred_tools_delta":
+                continue
+            found_delta = True
+            added_names |= set(attachment.get("addedNames") or [])
+            added_names -= set(attachment.get("removedNames") or [])
+            for key, raw_key in _DEFERRED_DELTA_DIAGNOSTIC_FIELDS.items():
+                diag[key] |= set(attachment.get(raw_key) or [])
+    servers = {name.split("__", 2)[1] for name in added_names if name.startswith("mcp__")}
+    return found_delta, servers, diag["pending"], diag["needs_auth"], diag["failed"]
+
+
+def test_live_mcp_announcement_stable_across_runs(live_server_params, tmp_path):
+    """R2 (#27): the reported symptom is that the deferred-tool list a harness run is
+    told about at startup contains only part of the real MCP-server set, and which
+    part varies run to run. There is no production fix in this repo for it -- the
+    announcement is assembled entirely inside the child `claude` CLI process, outside
+    this plugin's control (plan "premises verified") -- so this is a read-only probe,
+    not a regression test with a code fix behind it: three identical dispatches of the
+    same tiny agent must announce the same, complete MCP-server set every time, with
+    nothing still `pending` by the time the model's first turn happened. Expected to
+    fail today against a CLI actually exhibiting the symptom -- that failure IS the
+    evidence this ticket exists to capture, not a defect in the test itself."""
+    if shutil.which("claude") is None:
+        pytest.skip("the real `claude` CLI is not on PATH")
+
+    agents = tmp_path / "live-project" / ".claude" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "harness-mcp-announce.md").write_text(
+        "---\nname: harness-mcp-announce\n"
+        "description: Minimal agent for the MCP-announcement stability probe\n"
+        "model: haiku\n---\n"
+        "Reply with OK and nothing else.\n",
+        encoding="utf-8",
+    )
+
+    per_run = []
+    for _ in range(3):
+
+        async def scenario(session):
+            is_error, text, started = await _call(
+                session,
+                "harness_start_agent",
+                agent="harness-mcp-announce",
+                cwd=str(tmp_path / "live-project"),
+                model="haiku",
+            )
+            assert not is_error, text
+            final = await _poll_until_terminal(session, started["run_id"], budget=240.0)
+            inspected = await _call(session, "harness_inspect_run", run_id=started["run_id"])
+            return final, inspected
+
+        final, (is_error, text, inspected) = _run(scenario, live_server_params)
+        assert final["state"] == "COMPLETED", final
+        assert not is_error, text
+
+        found_delta, servers, pending, needs_auth, failed = _first_turn_announcement(
+            final["transcript_path"]
+        )
+        # (a) -- a missing delta means the ground-truth mechanism itself broke; fail
+        # loudly rather than let a format change masquerade as "nothing pending".
+        assert found_delta, (
+            "no deferred_tools_delta attachment entry was found before this run's "
+            f"first assistant turn (transcript: {final['transcript_path']}); the CLI's "
+            "transcript format appears to have changed -- this test can no longer tell "
+            "'announced' from 'never looked'"
+        )
+        per_run.append(
+            {
+                "servers": servers,
+                "pending": pending,
+                "needs_auth": needs_auth,
+                "failed": failed,
+                "init_mcp_servers": inspected["announced"]["mcp_servers"],
+                "init_tools": inspected["announced"]["tools"],
+            }
+        )
+
+    report = "\n".join(
+        f"run {i}: servers={sorted(r['servers'])} pending={sorted(r['pending'])} "
+        f"needs_auth(diagnostic only)={sorted(r['needs_auth'])} "
+        f"failed(diagnostic only)={sorted(r['failed'])} "
+        f"init_mcp_servers(diagnostic only, init event != announcement)={r['init_mcp_servers']} "
+        f"init_tools(diagnostic only)={r['init_tools']}"
+        for i, r in enumerate(per_run)
+    )
+
+    # (b) -- the same dispatch, repeated identically three times, must be told about
+    # the same MCP-server set every time. This is the ticket's own symptom.
+    server_sets = [r["servers"] for r in per_run]
+    assert server_sets[0] == server_sets[1] == server_sets[2], (
+        f"the announced MCP-server set varied across 3 identical runs:\n{report}"
+    )
+
+    # (c) -- nothing still connecting by the time the model's first turn happened, in
+    # any run: a stable-but-incomplete announcement would pass (b) while still being
+    # the symptom.
+    for i, r in enumerate(per_run):
+        assert not r["pending"], (
+            f"run {i} still had server(s) pending when the model's first turn "
+            f"happened -- the announcement was incomplete, not just late:\n{report}"
+        )
+
+    # Only after every assertion above has actually passed: an environment with no
+    # MCP servers configured at all would make (b)/(c) hold vacuously (equal empty
+    # sets, empty pending) without ever exercising what this test exists to check.
+    if all(not r["init_mcp_servers"] for r in per_run):
+        pytest.skip(f"held vacuously: no MCP server was announced in any run:\n{report}")
+
+
 @pytest.mark.timeout(300)  # exceeds the repo's global 60s default: real 240s poll budget below
 def test_live_wait_run_timeout_keeps_run_alive(live_server_params):
     if shutil.which("claude") is None:
