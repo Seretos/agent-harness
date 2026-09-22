@@ -774,17 +774,24 @@ def test_start_agent_repeated_launch_argv_is_identical(
     while everything else this plugin decided stayed byte-for-byte the same."""
     cwd = project_dir if carrier == "demo" else mcp_agent_project
 
-    session_ids = []
     for _ in range(3):
         started, final = _start_and_finish(
             server_params, agent=carrier, cwd=str(cwd), model="sonnet"
         )
         assert final["state"] == "COMPLETED", final
-        session_ids.append(final["session_id"])
 
     records = _argv_records(argv_log)
     assert len(records) == 3
-    assert len(set(session_ids)) == 3, "each run must get its own distinct session id"
+
+    # Distinctness must be checked on the raw `--session-id` value the CLI actually
+    # received, not on the run record's reported `session_id` -- the plugin could echo
+    # a fresh id in the payload while still sending the CLI a constant flag value, and
+    # `_normalized_argv` below deliberately masks this flag out of the equality check,
+    # so nothing else in this test reads it.
+    raw_session_ids = [_flag(record["argv"], "--session-id") for record in records]
+    assert len(set(raw_session_ids)) == 3, (
+        f"each run must send the CLI its own distinct --session-id: {raw_session_ids}"
+    )
 
     normalized = [_normalized_argv(r["argv"]) for r in records]
     assert normalized[0] == normalized[1] == normalized[2], normalized
@@ -793,6 +800,11 @@ def test_start_agent_repeated_launch_argv_is_identical(
 
     for record in records:
         assert _flag(record["argv"], "--setting-sources") == "user,project,local"
+        # Pinning the *current* launch shape, not a hard requirement: the Frame only
+        # asks that the MCP-server/setting-source flags be identical across runs. A
+        # future change could legitimately add explicit/strict MCP config to make the
+        # child launch deterministic in some other way; if that happens, update this
+        # assertion rather than treating its failure as a regression.
         assert "--strict-mcp-config" not in record["argv"]
 
     if carrier == "mcp-agent":

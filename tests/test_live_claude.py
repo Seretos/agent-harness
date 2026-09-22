@@ -437,10 +437,18 @@ def test_live_mcp_announcement_stable_across_runs(live_server_params, tmp_path):
             f"happened -- the announcement was incomplete, not just late:\n{report}"
         )
 
-    # Only after every assertion above has actually passed: an environment with no
-    # MCP servers configured at all would make (b)/(c) hold vacuously (equal empty
-    # sets, empty pending) without ever exercising what this test exists to check.
-    if all(not r["init_mcp_servers"] for r in per_run):
+    # Only after every assertion above has actually passed: an environment with no MCP
+    # servers configured at all would make (b)/(c) hold vacuously (equal empty sets,
+    # empty pending) without ever exercising what this test exists to check. This must
+    # be decided from the same ground truth as (b)/(c) -- the transcript-derived
+    # `servers`/`needs_auth`/`failed` sets -- not from the init event's
+    # `init_mcp_servers`/`init_tools` diagnostics: those are explicitly not the
+    # announcement (see "premises verified" / `_first_turn_announcement`'s docstring),
+    # so a run where the init event lists servers but the transcript's first-turn fold
+    # never mentions any (nothing added, nothing pending, nothing needing auth, nothing
+    # failed) would otherwise skip the vacuity check and let (b)/(c) pass on three
+    # empty sets that never compared anything.
+    if all(not (r["servers"] or r["needs_auth"] or r["failed"]) for r in per_run):
         pytest.skip(f"held vacuously: no MCP server was announced in any run:\n{report}")
 
 
