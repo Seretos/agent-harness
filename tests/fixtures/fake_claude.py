@@ -15,12 +15,29 @@ A prompt containing `TOOL:<name>` emits one assistant `tool_use` event for that 
 after the init event (before any SLEEP), so a still-RUNNING run's last activity is that tool.
 A prompt containing `ECHO:<word>` is answered with `<word>` instead of `OK`. The session
 id is taken from `--session-id <id>` or, for a resumed run, `--resume <id>`.
+A prompt containing `NO_INIT_NAMES` suppresses `INIT_ANNOUNCEMENTS` from the init event
+(a bare `{"type": "system", "subtype": "init", ...}`), so a test can exercise
+`harness_inspect_run`'s argv-derived `requested.*` fallback independently of what the
+init event announces.
 """
 import json
 import os
 import re
 import sys
 import time
+
+# Fixed name lists the init event announces, keyed to match `_INIT_NAME_FIELDS`'s
+# primary spelling (`mcp_servers`, `tools`, `skills`, `agents`) so a test can assert
+# `harness_inspect_run`'s `announced.*` against this constant instead of a literal.
+INIT_ANNOUNCEMENTS: dict[str, list[str]] = {
+    "mcp_servers": ["alpha-server", "beta-server"],
+    "tools": ["Read", "Bash", "Write"],
+    "skills": ["skill-one", "skill-two", "skill-three"],
+    "agents": ["agent-x", "agent-y"],
+}
+
+# Marker checked against the prompt (stdin) to suppress INIT_ANNOUNCEMENTS above.
+NO_INIT_NAMES = "NO_INIT_NAMES"
 
 
 def main() -> int:
@@ -41,7 +58,10 @@ def main() -> int:
 
     prompt = sys.stdin.read()
     match = re.search(r"SLEEP:(\d+(?:\.\d+)?)", prompt)
-    print(json.dumps({"type": "system", "subtype": "init", "session_id": session_id}), flush=True)
+    init_event = {"type": "system", "subtype": "init", "session_id": session_id}
+    if NO_INIT_NAMES not in prompt:
+        init_event.update(INIT_ANNOUNCEMENTS)
+    print(json.dumps(init_event), flush=True)
     tool = re.search(r"TOOL:(\w+)", prompt)
     if tool:
         print(
