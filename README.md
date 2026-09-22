@@ -74,7 +74,15 @@ It prints one `harness_poll_run`-shaped JSON object plus `waited_s` on stdout an
 
 ## Plugin agents
 
-A plugin's own `agents/*.md` definitions are discovered alongside project (`.claude/agents/`) and user-scope agents. A plugin-sourced agent is listed by `harness_list_agents` and started via `harness_start_agent` under a qualified name, `<plugin>:<name>` (e.g. `agent-harness:general-purpose`) — not the bare `<name>` that project- and user-scope agents use. Its `tools:` frontmatter field binds to the run's `--tools` allowlist, the same as any other agent definition. This plugin ships its own standard agents under `agents/`; their content is a separate change.
+A plugin's own `agents/*.md` definitions are discovered alongside project (`.claude/agents/`) and user-scope agents. A plugin-sourced agent is listed by `harness_list_agents` and started via `harness_start_agent` under a qualified name, `<plugin>:<name>` (e.g. `agent-harness:general-purpose`) — not the bare `<name>` that project- and user-scope agents use. Its `tools:` frontmatter field binds to the run's `--tools` allowlist, the same as any other agent definition: a `tools:` line is the complete list of tools the run gets, and a definition without one gets every tool.
+
+This plugin ships three standard agents under `agents/`:
+
+- `agent-harness:general-purpose` — open-ended, multi-step work; no `tools:` line, so every tool (edits files, runs commands).
+- `agent-harness:Explore` — locating code and answering questions about a codebase; read-only, no shell (`tools: Read, Glob, Grep, WebFetch, WebSearch`).
+- `agent-harness:Plan` — designing an implementation approach before code is written; the same read-only allowlist, no shell.
+
+None of the three pins a `model:` or `effort:`; a run inherits them from the parent session or the tool arguments.
 
 **Overriding a shipped agent:** discovery keys everything by qualified name and resolves project scope, then user scope, then plugin scope, first writer wins. Project and user agent files are named unprefixed — `.claude/agents/general-purpose.md` is discovered as `general-purpose`, a different key from `agent-harness:general-purpose` and not a replacement for it. To override a plugin-shipped agent, give a project or user `.md` file the plugin's qualified name explicitly, e.g. `name: agent-harness:general-purpose` in its frontmatter — that definition then wins over the plugin's own under that same key.
 
