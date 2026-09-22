@@ -245,6 +245,9 @@ def test_start_tools_document_accepted_values(server_params):
     assert "low" in effort_desc and "medium" in effort_desc and "high" in effort_desc, (
         "harness_start_agent effort description must name low/medium/high"
     )
+    assert "xhigh" in effort_desc and "max" in effort_desc, (
+        "harness_start_agent effort description must name xhigh/max"
+    )
     assert "--effort" in effort_desc
     _assert_states_positively(
         effort_desc, r"--effort", "harness_start_agent effort description"
@@ -256,7 +259,7 @@ def test_start_tools_document_accepted_values(server_params):
     )
 
     model_desc = agent_props["model"].get("description") or ""
-    for token in ("opus", "sonnet", "haiku", "claude-"):
+    for token in ("opus", "sonnet", "haiku", "fable", "default", "claude-"):
         assert token in model_desc, f"harness_start_agent model description missing {token!r}"
     _assert_states_positively(
         model_desc, r"\bmodel\b", "harness_start_agent model description"
@@ -268,7 +271,10 @@ def test_start_tools_document_accepted_values(server_params):
     )
 
     perm_desc = agent_props["permission_mode"].get("description") or ""
-    for token in ("default", "acceptEdits", "plan", "bypassPermissions", "inherit"):
+    for token in (
+        "default", "acceptEdits", "auto", "bypassPermissions", "dontAsk", "manual",
+        "plan", "inherit",
+    ):
         assert token in perm_desc, (
             f"harness_start_agent permission_mode description missing {token!r}"
         )
@@ -290,6 +296,9 @@ def test_start_tools_document_accepted_values(server_params):
     assert (
         "low" in prompt_effort_desc and "medium" in prompt_effort_desc and "high" in prompt_effort_desc
     ), "harness_start_prompt effort description must name low/medium/high"
+    assert "xhigh" in prompt_effort_desc and "max" in prompt_effort_desc, (
+        "harness_start_prompt effort description must name xhigh/max"
+    )
     # harness_start_prompt never reads parent-session context, so its unset
     # behaviour is the opposite direction from harness_start_agent's: no
     # fallback exists, the flag is simply omitted. Require a genuine negated
@@ -302,7 +311,7 @@ def test_start_tools_document_accepted_values(server_params):
     )
 
     prompt_model_desc = prompt_props["model"].get("description") or ""
-    for token in ("opus", "sonnet", "haiku", "claude-"):
+    for token in ("opus", "sonnet", "haiku", "fable", "default", "claude-"):
         assert token in prompt_model_desc, f"harness_start_prompt model description missing {token!r}"
     # Same asymmetry for model: harness_start_prompt has no session context to
     # fall back to, so the description must say the parameter is required
@@ -330,6 +339,37 @@ def test_start_tools_document_accepted_values(server_params):
     )
     _assert_states_negatively(
         start_prompt_desc, r"inherit", "harness_start_prompt description (not inherited)"
+    )
+
+
+def test_documented_values_match_lib_validator():
+    """R3: server.py's _ACCEPTED_VALUES for `effort` and `model` are exactly what
+    the pinned lib_python_harness's own hard validator (providers/claude_cli.py)
+    accepts before it ever launches a child -- not this repo's own guess,
+    re-derived from the lib's own constants rather than from --help text (the lib
+    validates effort/model itself; permission_mode is untouched by the lib and is
+    checked against the live CLI instead, in test_live_claude.py). `model`'s last
+    documented element is the full-model-id example, not an alias, so it is
+    excluded from the alias comparison; `inherit` is an agent-definition sentinel
+    (see the lib's own comment), not a CLI-accepted alias, so it is excluded too.
+    A lib bump that adds/removes an alias or effort level fails this test offline,
+    without needing the live CLI. Expected RED before the change: AssertionError
+    showing the missing {'xhigh', 'max'} and {'fable', 'default'}."""
+    from lib_python_harness.providers.claude_cli import _EFFORT_VALUES, _MODEL_ALIASES
+
+    from harness_plugin.server import _ACCEPTED_VALUES
+
+    documented_effort = set(_ACCEPTED_VALUES["effort"])
+    assert documented_effort == set(_EFFORT_VALUES), (
+        f"_ACCEPTED_VALUES['effort'] {documented_effort} must equal the lib "
+        f"validator's _EFFORT_VALUES {set(_EFFORT_VALUES)}"
+    )
+
+    documented_model_aliases = set(_ACCEPTED_VALUES["model"][:-1])
+    lib_aliases_minus_inherit = set(_MODEL_ALIASES) - {"inherit"}
+    assert documented_model_aliases == lib_aliases_minus_inherit, (
+        f"_ACCEPTED_VALUES['model'][:-1] {documented_model_aliases} must equal "
+        f"the lib validator's _MODEL_ALIASES minus 'inherit' {lib_aliases_minus_inherit}"
     )
 
 

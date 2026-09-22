@@ -117,8 +117,9 @@ def test_live_start_plugin_agent_colon_qualified(live_server_params, tmp_path):
 # what the app actually documents must fail this test on its own -- looping only
 # over _ACCEPTED_VALUES itself can't detect that, since an empty list makes the loop
 # body never run.
-_MIN_EFFORT = {"low", "medium", "high"}
-_MIN_PERMISSION_MODE = {"default", "acceptEdits", "plan", "bypassPermissions"}
+_MIN_PERMISSION_MODE = {
+    "default", "acceptEdits", "auto", "bypassPermissions", "dontAsk", "manual", "plan",
+}
 
 
 def _help_section(help_text, flag_name):
@@ -136,6 +137,18 @@ def _help_section(help_text, flag_name):
     match = pattern.search(help_text)
     assert match, f"{flag_name} not found in `claude --help` output:\n{help_text}"
     return match.group(0)
+
+
+def _help_choices(section):
+    """The quoted tokens inside a `(choices: "a", "b", ...)` parenthetical in a
+    `--help` section (e.g. --permission-mode's own block), with the surrounding
+    quotes stripped. `_help_section` only slices the flag's own block of `--help`
+    text; this turns that text into the actual list of tokens the CLI's own
+    parser prints, as data, so the reverse check (every printed choice must be
+    documented) has something to iterate instead of a bare substring test."""
+    match = re.search(r"\(choices:\s*(.*?)\)", section, re.DOTALL)
+    assert match, f"no '(choices: ...)' parenthetical found in section:\n{section}"
+    return set(re.findall(r'"([^"]*)"', match.group(1)))
 
 
 # Flag + real init-event field for a token whose category's --help choices
@@ -200,17 +213,25 @@ def _probe_cli_accepts(category, token):
 
 
 def test_accepted_values_match_the_cli():
-    """R6: the value lists this plugin documents in its tool schemas (server.py's
-    _ACCEPTED_VALUES) are the real CLI's, not invented. Every documented `effort`
-    and `permission_mode` token must appear in the real `claude --help` output,
-    scoped to that flag's own help section -- with one exception: a token --help's
-    printed choices don't list (currently only permission_mode's "default") falls
-    back to a real accept/reject probe against the live CLI (_probe_cli_accepts),
-    since --help's printed list is a proxy for "real", not the CLI's full truth,
-    and can't see a value the CLI genuinely accepts but doesn't advertise. Every
-    token --help *does* list stays checked exactly as strictly as before -- only
-    the not-listed case gets the fallback. Expected RED before the change:
-    ImportError -- _ACCEPTED_VALUES does not exist yet."""
+    """R4: the `permission_mode` value list this plugin documents in its tool
+    schemas (server.py's _ACCEPTED_VALUES) matches the real CLI's, not invented.
+    `effort` and `model` are no longer checked here -- their authority is the
+    pinned lib_python_harness's own hard validator, checked offline against the
+    lib's own constants by test_mcp_tools.py::test_documented_values_match_lib_
+    validator, which needs no live CLI. permission_mode has no lib validator, so
+    it stays checked against the live CLI, in both directions since --help's
+    printed choices are a lower bound, not an upper bound ("default" is
+    genuinely accepted but not printed -- see server.py's _ACCEPTED_VALUES
+    comment):
+    1. every choice --help prints under --permission-mode (_help_choices,
+       parsed as data, not a substring test) must be documented -- and the
+       parsed set must be non-empty, so an empty/failed parse can't vacuously
+       pass this check;
+    2. every documented token --help does *not* print must pass a real
+       accept/reject probe against the live CLI (_probe_cli_accepts), instead
+       of trusting --help's incomplete text.
+    Expected RED before the change: AssertionError naming auto/dontAsk/manual
+    as printed by --help but not (yet) in _ACCEPTED_VALUES['permission_mode']."""
     if shutil.which("claude") is None:
         pytest.skip("the real `claude` CLI is not on PATH")
 
@@ -220,27 +241,28 @@ def test_accepted_values_match_the_cli():
         ["claude", "--help"], capture_output=True, text=True, timeout=30
     ).stdout
 
-    documented_effort = set(_ACCEPTED_VALUES["effort"])
     documented_permission_mode = set(_ACCEPTED_VALUES["permission_mode"])
 
-    assert _MIN_EFFORT <= documented_effort, (
-        f"_ACCEPTED_VALUES['effort'] must cover at least {_MIN_EFFORT}, "
-        f"got {documented_effort}"
-    )
     assert _MIN_PERMISSION_MODE <= documented_permission_mode, (
         "_ACCEPTED_VALUES['permission_mode'] must cover at least "
         f"{_MIN_PERMISSION_MODE}, got {documented_permission_mode}"
     )
 
-    effort_section = _help_section(help_text, "--effort")
     permission_mode_section = _help_section(help_text, "--permission-mode")
+    printed_permission_mode = _help_choices(permission_mode_section)
+    assert printed_permission_mode, (
+        f"--permission-mode help text parsed to no choices at all: "
+        f"{permission_mode_section!r}"
+    )
 
-    for token in documented_effort:
-        assert token in effort_section, (
-            f"--effort help text is missing documented token {token!r}: {effort_section!r}"
-        )
+    undocumented = printed_permission_mode - documented_permission_mode
+    assert not undocumented, (
+        f"--permission-mode help prints {undocumented} that "
+        f"_ACCEPTED_VALUES['permission_mode'] does not document"
+    )
+
     for token in documented_permission_mode:
-        if token in permission_mode_section:
+        if token in printed_permission_mode:
             continue
         # Not among --help's printed choices for --permission-mode (e.g.
         # "default") -- fall back to a real accept/reject probe against the
