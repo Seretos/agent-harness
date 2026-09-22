@@ -190,7 +190,9 @@ def harness_start_agent(
     from: `agent_definition`, `argument`, `parent_session` or `none`. An optional short
     `label` names the run and shows up in harness_list_runs. An optional `prompt` is the
     run's task (the user message); the agent definition's body stays the system prompt.
-    Without `prompt` the run gets a default task."""
+    Without `prompt` the run gets a default task. The MCP-server/deferred-tool list a run is
+    announced at start-up can be incomplete; use ToolSearch before concluding a tool is
+    unavailable."""
     if prompt is not None and not prompt.strip():
         raise HarnessError("prompt must not be empty")
     data, source = load_session_context()
