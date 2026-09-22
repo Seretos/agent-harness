@@ -107,6 +107,48 @@ def project_dir(tmp_path) -> Path:
 
 
 @pytest.fixture
+def plugin_agent_install(tmp_path) -> Path:
+    """A minimal plugin install, `agent-harness@mk`, registered in
+    `<CLAUDE_CONFIG_DIR>/plugins/installed_plugins.json` and enabled via
+    `<CLAUDE_CONFIG_DIR>/settings.json`'s `enabledPlugins`, providing one agent
+    definition -- `agents/probe.md` (`tools: Read, Glob`, body `Say OK.`) --
+    discoverable as the colon-qualified `agent-harness:probe`. No `hooks`/
+    `mcpServers`, so a run dispatched through it always takes the `--agents`
+    JSON payload carrier, never the materialized one (which rewrites `:` to
+    `__` in both the file stem and `--agent`, and so would not exercise the
+    colon). `CLAUDE_CONFIG_DIR` itself is `tmp_path / "claude-config"`, the
+    same path `_base_env` (test_live_claude.py) points every server fixture
+    at. Returns the install directory."""
+    install_dir = tmp_path / "plugins" / "agent-harness"
+    agents = install_dir / "agents"
+    agents.mkdir(parents=True)
+    (agents / "probe.md").write_text(
+        "---\nname: probe\ndescription: Probe agent for plugin dispatch tests\n"
+        "tools: Read, Glob\n---\nSay OK.\n",
+        encoding="utf-8",
+    )
+    config = tmp_path / "claude-config"
+    (config / "plugins").mkdir(parents=True, exist_ok=True)
+    (config / "plugins" / "installed_plugins.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "plugins": {
+                    "agent-harness@mk": [
+                        {"scope": "user", "installPath": str(install_dir)}
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (config / "settings.json").write_text(
+        json.dumps({"enabledPlugins": {"agent-harness@mk": True}}), encoding="utf-8"
+    )
+    return install_dir
+
+
+@pytest.fixture
 def mcp_agent_project(tmp_path) -> Path:
     """A project cwd with one agent definition, `mcp-agent`, whose frontmatter sets
     `mcpServers:` — a key the `--agents` JSON schema rejects (`AGENT_JSON_KEYS`), so
