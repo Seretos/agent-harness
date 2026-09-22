@@ -69,3 +69,11 @@ It prints one `harness_poll_run`-shaped JSON object plus `waited_s` on stdout an
 | 2 | `--timeout` (if given) elapsed; the run is still RUNNING |
 | 3 | run CANCELLED |
 | 4 | error: unknown run id, unreadable artifacts dir, or invalid arguments |
+
+## Plugin agents
+
+A plugin's own `agents/*.md` definitions are discovered alongside project (`.claude/agents/`) and user-scope agents. A plugin-sourced agent is listed by `harness_list_agents` and started via `harness_start_agent` under a qualified name, `<plugin>:<name>` (e.g. `agent-harness:general-purpose`) — not the bare `<name>` that project- and user-scope agents use. Its `tools:` frontmatter field binds to the run's `--tools` allowlist, the same as any other agent definition. This plugin ships its own standard agents under `agents/`; their content is a separate change.
+
+**Overriding a shipped agent:** discovery keys everything by qualified name and resolves project scope, then user scope, then plugin scope, first writer wins. Project and user agent files are named unprefixed — `.claude/agents/general-purpose.md` is discovered as `general-purpose`, a different key from `agent-harness:general-purpose` and not a replacement for it. To override a plugin-shipped agent, give a project or user `.md` file the plugin's qualified name explicitly, e.g. `name: agent-harness:general-purpose` in its frontmatter — that definition then wins over the plugin's own under that same key.
+
+Colon-qualified plugin-agent dispatch is covered by a fake-CLI test in CI plus an opt-in live test (`tests/test_live_claude.py::test_live_start_plugin_agent_colon_qualified`), deselected by default. To run it, provision a real `CLAUDE_CONFIG_DIR` holding a `harness-live-fixture@<any>` plugin install with `agents/echo.md` (`model: haiku`, `tools: Read`), `settings.json` enabling that plugin, and real credentials; point `HARNESS_LIVE_PLUGIN_CONFIG_DIR` at it and run `python -m pytest -m live tests/test_live_claude.py`.
