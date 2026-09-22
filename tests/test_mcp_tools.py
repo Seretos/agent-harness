@@ -135,6 +135,48 @@ def test_tools_list_exposes_harness_tools_and_no_ping(server_params):
         )
 
 
+_NEGATORS = re.compile(
+    r"\b(not|never|no|isn'?t|doesn'?t|won'?t|ignor\w*|discard\w*|drop\w*)\b", re.I
+)
+
+
+def _clauses_mentioning(text, token_re):
+    """The clause(s) of `text` that mention `token_re`, splitting on sentence- and
+    clause-ending punctuation (including `;`) so a negation attached to one claim
+    (e.g. "...; nothing is not inherited") cannot leak into an unrelated clause
+    that shares the same sentence (e.g. "--permission-mode is forwarded...")."""
+    token = re.compile(token_re, re.I)
+    return [s for s in re.split(r"(?<=[.!?;])\s+", text) if token.search(s)]
+
+
+def _assert_states_positively(desc, token_re, label):
+    """At least one sentence mentions `token_re`, and none of those sentences carry
+    a negation word -- kills a description that contains the right tokens while
+    stating the opposite fact (e.g. "...--effort is ignored and never passed"),
+    which bare substring-presence checks cannot tell apart from a true claim."""
+    clauses = _clauses_mentioning(desc, token_re)
+    assert clauses, f"{label}: no sentence mentions {token_re!r} in: {desc!r}"
+    for clause in clauses:
+        assert not _NEGATORS.search(clause), (
+            f"{label}: sentence about {token_re!r} reads as a negative/opposite "
+            f"claim: {clause!r}"
+        )
+
+
+def _assert_states_negatively(desc, token_re, label):
+    """At least one sentence mentions `token_re` AND carries a negation word --
+    proves the description actually states the negative fact (e.g. "the parent's
+    mode is not inherited") rather than merely containing the bare tokens, which a
+    description asserting the opposite ("...is forwarded from the parent") would
+    also satisfy if only presence were checked."""
+    clauses = _clauses_mentioning(desc, token_re)
+    assert clauses, f"{label}: no sentence mentions {token_re!r} in: {desc!r}"
+    assert any(_NEGATORS.search(clause) for clause in clauses), (
+        f"{label}: no sentence about {token_re!r} carries a negation -- can't tell "
+        f"'is inherited'/'is passed' from 'is not' from bare tokens alone: {clauses!r}"
+    )
+
+
 def test_start_tools_document_accepted_values(server_params):
     """R3: tools/list names the accepted values for model/effort/permission_mode, per
     tool. `harness_start_agent`'s inputSchema.properties for model, effort and
@@ -143,8 +185,13 @@ def test_start_tools_document_accepted_values(server_params):
     property at all, and its tool description says it sends no permission mode to
     the child and does not inherit the parent's. Fixed literal tokens, written
     independently of _ACCEPTED_VALUES (asserting against the constant the code
-    consumed would be vacuous), all plain substring/regex presence, no proximity
-    conditions."""
+    consumed would be vacuous). Beyond bare substring presence -- which a
+    description stating the opposite fact while still containing every required
+    token would also satisfy -- the four claims that have a "which way does this
+    go" direction (start_agent's effort/model/permission_mode passthrough and
+    inheritance, start_prompt's flag-omission and non-inheritance) are additionally
+    checked sentence-by-sentence for the correct polarity via
+    _assert_states_positively/_assert_states_negatively."""
 
     async def scenario(session):
         return (await session.list_tools()).tools
@@ -160,16 +207,25 @@ def test_start_tools_document_accepted_values(server_params):
         "harness_start_agent effort description must name low/medium/high"
     )
     assert "--effort" in effort_desc
+    _assert_states_positively(
+        effort_desc, r"--effort", "harness_start_agent effort description"
+    )
 
     model_desc = agent_props["model"].get("description") or ""
     for token in ("opus", "sonnet", "haiku", "claude-"):
         assert token in model_desc, f"harness_start_agent model description missing {token!r}"
+    _assert_states_positively(
+        model_desc, r"\bmodel\b", "harness_start_agent model description"
+    )
 
     perm_desc = agent_props["permission_mode"].get("description") or ""
     for token in ("default", "acceptEdits", "plan", "bypassPermissions", "inherit"):
         assert token in perm_desc, (
             f"harness_start_agent permission_mode description missing {token!r}"
         )
+    _assert_states_positively(
+        perm_desc, r"inherit", "harness_start_agent permission_mode description"
+    )
 
     start_prompt = by_name["harness_start_prompt"]
     prompt_props = start_prompt.inputSchema["properties"]
@@ -190,6 +246,15 @@ def test_start_tools_document_accepted_values(server_params):
     assert "--permission-mode" in start_prompt_desc
     assert "not inherited" in start_prompt_desc.lower(), (
         "harness_start_prompt description must say the parent session's mode is not inherited"
+    )
+    # Polarity: a description that says the flag *is* forwarded / the mode *is*
+    # inherited would still contain both bare tokens above. Require an actual
+    # negation attached to each claim, not just the tokens.
+    _assert_states_negatively(
+        start_prompt_desc, r"--permission-mode", "harness_start_prompt description (flag not sent)"
+    )
+    _assert_states_negatively(
+        start_prompt_desc, r"inherit", "harness_start_prompt description (not inherited)"
     )
 
 
@@ -517,6 +582,24 @@ def _start_and_finish(params, **arguments):
     return _run(scenario, params)
 
 
+def _poll_from_fresh_process(params, run_id):
+    """Poll `run_id` from a brand-new `python -m harness_plugin` subprocess -- not
+    the one that started the run. Each `_run()` call launches its own server
+    process (see `_session`/`stdio_client` above), so this proves a value survives
+    to a genuinely separate invocation rather than merely a later call within the
+    same in-memory server process -- the distinction the plan's provenance design
+    relies on ("possibly from another process (`harness wait`)"). A value kept only
+    in a module-level dict keyed by run_id in the server process would be empty
+    here and fail; the on-disk run record the plan actually specifies survives."""
+
+    async def scenario(session):
+        polled = await _call(session, "harness_poll_run", run_id=run_id)
+        assert not polled[0], polled[1]
+        return polled[2]
+
+    return _run(scenario, params)
+
+
 def test_start_agent_inherits_session_context(server_params, session_context, argv_log):
     started, final = _start_and_finish(server_params, agent="demo")
     assert final["state"] == "COMPLETED"
@@ -724,19 +807,20 @@ def test_effort_source_reports_where_the_value_came_from_for_start_agent(
     """R2 (a)-(c): effort_source is agent_definition when the definition sets
     effort:, argument for an explicit argument with no definition value,
     parent_session for the inherited snapshot value -- and it persists into the
-    later poll answer. `effort-agent`'s own frontmatter value must win over both the
+    later poll answer, re-read by a genuinely separate server process (not the one
+    that started the run) so a value kept only in that process's memory could not
+    satisfy this. `effort-agent`'s own frontmatter value must win over both the
     explicit argument and the session's `effort: high` (pre-existing library
     behaviour: `effort = definition.effort or host_context.effort`, with no
     argument re-application for effort, unlike model)."""
 
-    async def scenario(session):
+    async def start_scenario(session):
         is_error, text, started = await _call(session, "harness_start_agent", **kwargs)
         assert not is_error, text
-        polled = await _call(session, "harness_poll_run", run_id=started["run_id"])
-        assert not polled[0], polled[1]
-        return started, polled[2]
+        return started
 
-    started, polled = _run(scenario, server_params)
+    started = _run(start_scenario, server_params)
+    polled = _poll_from_fresh_process(server_params, started["run_id"])
     (record,) = _argv_records(argv_log)
     assert _flag(record["argv"], "--effort") == expect_effort
     assert started["effort"] == expect_effort
@@ -749,7 +833,9 @@ def test_effort_source_none_when_session_lacks_effort(
     server_params, tmp_path, project_dir, argv_log
 ):
     """R2 (d): a session file without `effort` and no explicit argument ->
-    effort_source == "none", no --effort token."""
+    effort_source == "none", no --effort token. The later poll is re-read by a
+    fresh server process (not the one that started the run) -- see
+    `_poll_from_fresh_process`."""
     plant_session_file(
         tmp_path / "plugin-data",
         SESSION_ID,
@@ -758,14 +844,13 @@ def test_effort_source_none_when_session_lacks_effort(
         model="opus",
     )
 
-    async def scenario(session):
+    async def start_scenario(session):
         is_error, text, started = await _call(session, "harness_start_agent", agent="demo")
         assert not is_error, text
-        polled = await _call(session, "harness_poll_run", run_id=started["run_id"])
-        assert not polled[0], polled[1]
-        return started, polled[2]
+        return started
 
-    started, polled = _run(scenario, server_params)
+    started = _run(start_scenario, server_params)
+    polled = _poll_from_fresh_process(server_params, started["run_id"])
     (record,) = _argv_records(argv_log)
     assert "--effort" not in record["argv"]
     assert started["effort"] is None
@@ -774,18 +859,19 @@ def test_effort_source_none_when_session_lacks_effort(
 
 
 def test_effort_source_argument_for_start_prompt(server_params, argv_log):
-    """R2 (f): harness_start_prompt(effort="low") -> effort_source == "argument"."""
+    """R2 (f): harness_start_prompt(effort="low") -> effort_source == "argument".
+    The later poll is re-read by a fresh server process (not the one that started
+    the run) -- see `_poll_from_fresh_process`."""
 
-    async def scenario(session):
+    async def start_scenario(session):
         is_error, text, started = await _call(
             session, "harness_start_prompt", prompt="Say OK.", model="sonnet", effort="low"
         )
         assert not is_error, text
-        polled = await _call(session, "harness_poll_run", run_id=started["run_id"])
-        assert not polled[0], polled[1]
-        return started, polled[2]
+        return started
 
-    started, polled = _run(scenario, server_params)
+    started = _run(start_scenario, server_params)
+    polled = _poll_from_fresh_process(server_params, started["run_id"])
     (record,) = _argv_records(argv_log)
     assert _flag(record["argv"], "--effort") == "low"
     assert started["effort_source"] == "argument"
@@ -798,18 +884,18 @@ def test_effort_source_none_for_start_prompt_even_with_session_effort(
     """R2 (e): harness_start_prompt with no `effort` while the session carries
     `effort: high` -> effort_source == "none" and no --effort token -- "none" must
     mean "CLI default", not a dropped inheritance, since harness_start_prompt never
-    reads the session context at all."""
+    reads the session context at all. The later poll is re-read by a fresh server
+    process (not the one that started the run) -- see `_poll_from_fresh_process`."""
 
-    async def scenario(session):
+    async def start_scenario(session):
         is_error, text, started = await _call(
             session, "harness_start_prompt", prompt="Say OK.", model="sonnet"
         )
         assert not is_error, text
-        polled = await _call(session, "harness_poll_run", run_id=started["run_id"])
-        assert not polled[0], polled[1]
-        return started, polled[2]
+        return started
 
-    started, polled = _run(scenario, server_params)
+    started = _run(start_scenario, server_params)
+    polled = _poll_from_fresh_process(server_params, started["run_id"])
     (record,) = _argv_records(argv_log)
     assert "--effort" not in record["argv"]
     assert started["effort"] is None
@@ -819,19 +905,27 @@ def test_effort_source_none_for_start_prompt_even_with_session_effort(
 
 def test_send_message_reports_origin_runs_effort_source(server_params, argv_log):
     """R2 additional edge-case coverage: harness_send_message on a finished run
-    reports the origin run's effort_source."""
+    reports the origin run's effort_source. The origin run is started and finished
+    in one server process; harness_send_message is then issued from a second,
+    fresh process (not the one that started/finished the origin run), so an
+    effort_source kept only in the first process's memory could not answer it."""
 
-    async def scenario(session):
+    async def start_scenario(session):
         is_error, text, origin = await _call(
             session, "harness_start_prompt", prompt="Say OK.", model="sonnet", effort="low"
         )
         assert not is_error, text
         await _poll_until_terminal(session, origin["run_id"])
+        return origin
+
+    origin = _run(start_scenario, server_params)
+
+    async def send_scenario(session):
         sent = await _call(session, "harness_send_message", run_id=origin["run_id"], prompt="hi")
         assert not sent[0], sent[1]
-        return origin, sent[2]
+        return sent[2]
 
-    origin, follow_up = _run(scenario, server_params)
+    follow_up = _run(send_scenario, server_params)
     assert origin["effort_source"] == "argument"
     assert follow_up["effort_source"] == "argument"
     assert follow_up["effort"] == "low"

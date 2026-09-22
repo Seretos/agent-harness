@@ -1,6 +1,7 @@
 """Live test against the real `claude` CLI. Deselected by default; run with
 `python -m pytest -m live`."""
 import os
+import re
 import shutil
 import subprocess
 
@@ -109,12 +110,42 @@ def test_live_start_plugin_agent_colon_qualified(live_server_params, tmp_path):
     )
 
 
+# Hardcoded, independent of _ACCEPTED_VALUES: the minimum this repo already commits
+# to elsewhere (test_mcp_tools.py's argv assertions, scripts/build.ps1, the ticket).
+# An _ACCEPTED_VALUES that is empty, truncated, or has silently drifted away from
+# what the app actually documents must fail this test on its own -- looping only
+# over _ACCEPTED_VALUES itself can't detect that, since an empty list makes the loop
+# body never run.
+_MIN_EFFORT = {"low", "medium", "high"}
+_MIN_PERMISSION_MODE = {"default", "acceptEdits", "plan", "bypassPermissions"}
+
+
+def _help_section(help_text, flag_name):
+    """The block of `claude --help` between this flag's own entry and the next
+    flag's entry, so a token check can be scoped to the right flag's help instead
+    of the whole document -- a token invented for, or only appearing under, an
+    unrelated flag (e.g. a documented permission mode that is really the name of a
+    different flag like --verbose) must not be able to satisfy the check by simply
+    occurring somewhere else in the output."""
+    pattern = re.compile(
+        rf"^[ \t]*(?:-\w,\s*)?{re.escape(flag_name)}\b.*?"
+        rf"(?=^[ \t]*(?:-\w,\s*)?-{{1,2}}[\w-]|\nCommands:|\Z)",
+        re.MULTILINE | re.DOTALL,
+    )
+    match = pattern.search(help_text)
+    assert match, f"{flag_name} not found in `claude --help` output:\n{help_text}"
+    return match.group(0)
+
+
 def test_accepted_values_match_the_cli():
     """R6: the value lists this plugin documents in its tool schemas (server.py's
     _ACCEPTED_VALUES) are the real CLI's, not invented. Every documented `effort`
-    and `permission_mode` token must appear in the real `claude --help` output for
-    its flag. Expected RED before the change: ImportError -- _ACCEPTED_VALUES does
-    not exist yet."""
+    and `permission_mode` token must appear in the real `claude --help` output,
+    scoped to that flag's own help section -- not just the loop-over-the-constant
+    check, which would also pass if the app's own list were empty, truncated, or
+    matched a token that merely appears somewhere else in the help text (e.g. under
+    a different flag). Expected RED before the change: ImportError --
+    _ACCEPTED_VALUES does not exist yet."""
     if shutil.which("claude") is None:
         pytest.skip("the real `claude` CLI is not on PATH")
 
@@ -124,11 +155,29 @@ def test_accepted_values_match_the_cli():
         ["claude", "--help"], capture_output=True, text=True, timeout=30
     ).stdout
 
-    for token in _ACCEPTED_VALUES["effort"]:
-        assert token in help_text, f"--effort help text is missing documented token {token!r}"
-    for token in _ACCEPTED_VALUES["permission_mode"]:
-        assert token in help_text, (
-            f"--permission-mode help text is missing documented token {token!r}"
+    documented_effort = set(_ACCEPTED_VALUES["effort"])
+    documented_permission_mode = set(_ACCEPTED_VALUES["permission_mode"])
+
+    assert _MIN_EFFORT <= documented_effort, (
+        f"_ACCEPTED_VALUES['effort'] must cover at least {_MIN_EFFORT}, "
+        f"got {documented_effort}"
+    )
+    assert _MIN_PERMISSION_MODE <= documented_permission_mode, (
+        "_ACCEPTED_VALUES['permission_mode'] must cover at least "
+        f"{_MIN_PERMISSION_MODE}, got {documented_permission_mode}"
+    )
+
+    effort_section = _help_section(help_text, "--effort")
+    permission_mode_section = _help_section(help_text, "--permission-mode")
+
+    for token in documented_effort:
+        assert token in effort_section, (
+            f"--effort help text is missing documented token {token!r}: {effort_section!r}"
+        )
+    for token in documented_permission_mode:
+        assert token in permission_mode_section, (
+            f"--permission-mode help text is missing documented token {token!r}: "
+            f"{permission_mode_section!r}"
         )
 
 
