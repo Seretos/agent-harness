@@ -72,7 +72,9 @@ _ACCEPTED_VALUES: dict[str, tuple[str, ...]] = {
 _EFFORT_VALUES_TEXT = ", ".join(_ACCEPTED_VALUES["effort"])
 _MODEL_VALUES_TEXT = (
     ", ".join(_ACCEPTED_VALUES["model"][:-1])
-    + ", or a full model id containing claude/anthropic/opus/sonnet/haiku/fable "
+    + ", or a full model id with a segment (split on non-alphanumeric "
+    + "characters, e.g. `-`, `.`, `/`) that exactly equals "
+    + "claude/anthropic/opus/sonnet/haiku/fable "
     + f"(e.g. {_ACCEPTED_VALUES['model'][-1]}); anything else is refused before launch"
 )
 _PERMISSION_MODE_VALUES_TEXT = ", ".join(_ACCEPTED_VALUES["permission_mode"])
