@@ -6,7 +6,7 @@ import inspect
 import os
 import sys
 from functools import partial
-from typing import Any
+from typing import Annotated, Any
 
 import anyio.to_thread
 from lib_python_harness import (
@@ -20,6 +20,7 @@ from lib_python_harness import (
 )
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+from pydantic import Field
 
 from harness_plugin.host_context import (
     build_host_context,
@@ -27,9 +28,90 @@ from harness_plugin.host_context import (
     probe_warning,
     sessions_dir,
 )
-from harness_plugin.runs import artifacts_root, harness, inspect_run, run_to_dict, summary_to_dict
+from harness_plugin.runs import (
+    artifacts_root,
+    harness,
+    inspect_run,
+    launched_fields,
+    remember_effort_source,
+    run_to_dict,
+    summary_to_dict,
+)
 
 mcp = FastMCP("harness")
+
+# "Accepted" per value, from each value's own authority (plan "Who decides
+# accepted"), not this repo's own guess:
+# - effort/model are enumerated from the pinned lib_python_harness's own hard
+#   validator (providers/claude_cli.py's _EFFORT_VALUES/_MODEL_ALIASES), which
+#   raises UnsupportedByProvider before a child ever launches -- see
+#   tests/test_mcp_tools.py::test_documented_values_match_lib_validator.
+#   `inherit` is excluded from the model aliases: it is an agent-definition
+#   sentinel, not a CLI-accepted value (the lib's own comment, claude_cli.py:
+#   33-35). model's *last* tuple element is a full-model-id example, not an
+#   alias (see _MODEL_VALUES_TEXT's `[:-1]`/`[-1]` split below).
+# - permission_mode has no lib validator (claude_cli.py passes it straight
+#   through), so it is enumerated from the live `claude` CLI instead --
+#   tests/test_live_claude.py::test_accepted_values_match_the_cli. "default"
+#   is NOT among the tokens `--help` prints under `--permission-mode`'s own
+#   "(choices: ...)" text, but it is genuinely accepted by the CLI: a real run
+#   started with `--permission-mode default` completes, and its stream-json
+#   init event reports the value straight back (`"permissionMode":"default"`)
+#   -- probe-verified (_probe_cli_accepts), not just trusted from --help text.
+_ACCEPTED_VALUES: dict[str, tuple[str, ...]] = {
+    "effort": ("low", "medium", "high", "xhigh", "max"),
+    "permission_mode": (
+        "default", "acceptEdits", "auto", "bypassPermissions", "dontAsk", "manual", "plan",
+    ),
+    # Last element is a full-model-id *example*, not an accepted alias -- keep
+    # it last, _MODEL_VALUES_TEXT and test_documented_values_match_lib_validator
+    # both rely on that position (`[:-1]` for aliases, `[-1]` for the example).
+    "model": ("opus", "sonnet", "haiku", "fable", "default", "claude-haiku-4-5-20251001"),
+}
+
+_EFFORT_VALUES_TEXT = ", ".join(_ACCEPTED_VALUES["effort"])
+_MODEL_VALUES_TEXT = (
+    ", ".join(_ACCEPTED_VALUES["model"][:-1])
+    + ", or a full model id with a segment (split on non-alphanumeric "
+    + "characters, e.g. `-`, `.`, `/`) that exactly equals "
+    + "claude/anthropic/opus/sonnet/haiku/fable "
+    + f"(e.g. {_ACCEPTED_VALUES['model'][-1]}); anything else is refused before launch"
+)
+_PERMISSION_MODE_VALUES_TEXT = ", ".join(_ACCEPTED_VALUES["permission_mode"])
+
+_EFFORT_DESC_AGENT = (
+    f"Effort level passed to the child as `--effort <value>` (accepted values: "
+    f"{_EFFORT_VALUES_TEXT}). Unset, it falls back to the parent session's "
+    f"effort; if that is absent too, the effort is left unspecified and the "
+    f"CLI's own default applies."
+)
+
+_EFFORT_DESC_PROMPT = (
+    f"Effort level passed to the child as `--effort <value>` (accepted values: "
+    f"{_EFFORT_VALUES_TEXT}). This tool never reads the parent session's "
+    f"context, so leaving it unset sends no `--effort` flag at all and the "
+    f"CLI's own default effort is used -- nothing here is inherited."
+)
+
+_MODEL_DESC_AGENT = (
+    f"Model for the run (accepted values: {_MODEL_VALUES_TEXT}). Unset, the "
+    f"model falls back to the parent session's model; if the parent session "
+    f"has none either, model resolution fails and the run is refused."
+)
+
+_MODEL_DESC_PROMPT = (
+    f"Model for the run (accepted values: {_MODEL_VALUES_TEXT}). Required: "
+    f"harness_start_prompt has no session context to fall back to, so this "
+    f"must always be supplied explicitly."
+)
+
+_PERMISSION_MODE_DESC_AGENT = (
+    f"Permission mode for the run (accepted values: "
+    f"{_PERMISSION_MODE_VALUES_TEXT}). Unset, it inherits the parent session's "
+    f"permission mode; the call is refused if neither an explicit value nor an "
+    f"inherited one is available."
+)
+
 
 def _tool_errors(fn):
     """Re-raise lib errors as ToolError carrying the exception class name."""
@@ -90,20 +172,25 @@ def harness_list_agents(cwd: str | None = None) -> dict[str, Any]:
 def harness_start_agent(
     agent: str,
     cwd: str | None = None,
-    model: str | None = None,
-    permission_mode: str | None = None,
-    effort: str | None = None,
+    model: Annotated[str | None, Field(description=_MODEL_DESC_AGENT)] = None,
+    permission_mode: Annotated[
+        str | None, Field(description=_PERMISSION_MODE_DESC_AGENT)
+    ] = None,
+    effort: Annotated[str | None, Field(description=_EFFORT_DESC_AGENT)] = None,
     label: str | None = None,
     prompt: str | None = None,
 ) -> dict[str, Any]:
     """Start a discovered subagent (by qualified_name) as a background run and return its
     run_id immediately; use harness_poll_run or harness_wait_run for the result. The run
     inherits the parent session's permission mode, model, effort and cwd (collected by the
-    plugin hook); explicit arguments override them. Refuses when the session context cannot
-    be determined. `context_source`, `cwd`, `permission_mode` and `model` are echoed back.
-    An optional short `label` names the run and shows up in harness_list_runs. An optional
-    `prompt` is the run's task (the user message); the agent definition's body stays the
-    system prompt. Without `prompt` the run gets a default task."""
+    plugin hook); explicit arguments override them, and an agent definition's own `effort:`
+    (or `model:`/`permission_mode:`) outranks both. Refuses when the session context cannot
+    be determined. `context_source`, `cwd`, `permission_mode`, `model`, `effort` and
+    `effort_source` are echoed back -- `effort_source` names where the launched effort came
+    from: `agent_definition`, `argument`, `parent_session` or `none`. An optional short
+    `label` names the run and shows up in harness_list_runs. An optional `prompt` is the
+    run's task (the user message); the agent definition's body stays the system prompt.
+    Without `prompt` the run gets a default task."""
     if prompt is not None and not prompt.strip():
         raise HarnessError("prompt must not be empty")
     data, source = load_session_context()
@@ -139,15 +226,28 @@ def harness_start_agent(
         raise ToolError(
             f"no model for agent {agent!r}: pass `model` or set `model:` in its definition"
         )
+    # Mirrors resolve()'s own real precedence (`effort = definition.effort or
+    # host_context.effort`, plan Approach) rather than assuming one: a definition's
+    # own `effort:` always wins (pre-existing library behaviour, reported truthfully
+    # here, not fixed); otherwise the explicit argument; otherwise the parent
+    # session's snapshot; otherwise nothing supplied one at all.
+    if definition.effort:
+        effort_source = "agent_definition"
+    elif effort:
+        effort_source = "argument"
+    elif data.get("effort"):
+        effort_source = "parent_session"
+    else:
+        effort_source = "none"
     spec.cwd = used
     spec.label = label
     spec.artifacts_dir = artifacts_root()
+    result = harness().start(spec)
+    remember_effort_source(result.run_id, effort_source)
     return run_to_dict(
-        harness().start(spec),
+        result,
         cwd=used,
         context_source=source,
-        permission_mode=ctx.permission_mode,
-        model=spec.model,
     )
 
 
@@ -155,15 +255,21 @@ def harness_start_agent(
 @_tool_errors
 def harness_start_prompt(
     prompt: str,
-    model: str,
-    effort: str | None = None,
+    model: Annotated[str, Field(description=_MODEL_DESC_PROMPT)],
+    effort: Annotated[str | None, Field(description=_EFFORT_DESC_PROMPT)] = None,
     system_prompt: str | None = None,
     cwd: str | None = None,
     label: str | None = None,
 ) -> dict[str, Any]:
     """Start an ad-hoc prompt in a clean (no memory, no project config) run and return its
     run_id immediately. With `cwd` unset the run gets a fresh empty temp directory; a given
-    `cwd` must exist, be empty and not sit inside a git repository. An optional short `label` names the run and shows up in
+    `cwd` must exist, be empty and not sit inside a git repository. No permission mode is
+    ever sent to the child: `--permission-mode` is never passed, and the parent session's
+    permission mode is not inherited -- the CLI's own default permission mode is used
+    instead. `effort` and `effort_source` are echoed back in the answer (`effort_source`
+    is `argument` when `effort` was passed, else `none` -- this tool never reads the
+    parent session, so `none` here always means "CLI default", never a dropped
+    inheritance). An optional short `label` names the run and shows up in
     harness_list_runs."""
     spec = RunSpec(
         prompt=prompt,
@@ -175,7 +281,9 @@ def harness_start_prompt(
         label=label,
         artifacts_dir=artifacts_root(),
     )
-    return run_to_dict(harness().start(spec))
+    result = harness().start(spec)
+    remember_effort_source(result.run_id, "argument" if effort else "none")
+    return run_to_dict(result)
 
 
 @mcp.tool()
@@ -209,7 +317,15 @@ def harness_send_message(run_id: str, prompt: str) -> dict[str, Any]:
     harness_poll_run on the new run_id to get the reply."""
     if not prompt.strip():
         raise HarnessError("prompt must not be empty")
-    return run_to_dict(harness().start_resume(run_id, prompt), resumed_from=run_id)
+    # The origin's argv (and thus its launched `effort` value) is replayed
+    # verbatim by start_resume() (harness.py's provider_argv replay), so
+    # launched_fields() answers `effort` for the new run with no extra plumbing
+    # -- but `effort_source` lives only on the origin's own record and is not
+    # copied by the library, so it must be looked up and re-stamped explicitly.
+    origin_source = launched_fields(run_id)["effort_source"]
+    result = harness().start_resume(run_id, prompt)
+    remember_effort_source(result.run_id, origin_source)
+    return run_to_dict(result, resumed_from=run_id)
 
 
 @mcp.tool()

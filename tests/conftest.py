@@ -95,12 +95,21 @@ def server_params_no_context(tmp_path) -> StdioServerParameters:
 
 @pytest.fixture
 def project_dir(tmp_path) -> Path:
-    """A project cwd with one agent definition, `demo`."""
+    """A project cwd with two agent definitions: `demo` (no `effort:`) and
+    `effort-agent` (`effort: medium` in its own frontmatter, distinct from both
+    session_context's `effort: high` and any explicit argument used in tests, so a
+    test can tell "the definition's value won" apart from "the argument's" or "the
+    session's")."""
     agents = tmp_path / "project" / ".claude" / "agents"
     agents.mkdir(parents=True)
     (agents / "demo.md").write_text(
         "---\nname: demo\ndescription: Demo agent for tests\n"
         "skills: [demo-skill-a, demo-skill-b]\n---\nSay OK.\n",
+        encoding="utf-8",
+    )
+    (agents / "effort-agent.md").write_text(
+        "---\nname: effort-agent\ndescription: Agent with its own fixed effort\n"
+        "effort: medium\n---\nSay OK.\n",
         encoding="utf-8",
     )
     return tmp_path / "project"
