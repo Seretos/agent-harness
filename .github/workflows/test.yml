@@ -1,16 +1,20 @@
 name: tests
 
-# Runs pytest on every push to any branch and on every PR. Distinct from
-# release.yml, which is workflow_dispatch-driven and produces the OS-specific
-# binaries / release zip.
+# Runs pytest on every PR. Distinct from release.yml, which is
+# workflow_dispatch-driven and produces the OS-specific binaries / release zip.
+#
+# Deliberately `pull_request:` only, not also `push:` — every commit on an
+# open PR already fires `pull_request` (opened/synchronize/reopened), so a
+# branch-scoped `push:` trigger alongside it doubled every run (two parallel
+# "tests" workflow runs per commit, `event: pull_request` and `event: push`,
+# racing each other for no benefit). The quality gate is "every PR runs the
+# full suite" — this still guarantees that; it just stops running it twice.
 #
 # OS_TARGETS default: [windows, linux]. If the plugin is genuinely Windows-only
 # (e.g. depends on Win32 / COM, like agent-vdesktop), drop ubuntu-22.04 from
 # the matrix and switch release.yml to a single-OS pipeline — see AGENTS.md
 # "OS_TARGETS" for the Windows-only override.
 on:
-  push:
-    branches: ["**"]
   pull_request:
 
 permissions:
@@ -23,7 +27,14 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-22.04]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    # TEMPORARY: dropped from 10 to diagnose ticket #25's PR #33 — every CI run
+    # on that branch got killed at ~10m (reported as `cancelled`, not
+    # `failure`/`timed_out`, which is why it looked like external interference).
+    # A known-good run finishes the whole suite in ~99s, so something hangs
+    # intermittently past that; a short timeout should surface it as a job
+    # failure with a log pointing at the stuck step instead of silently
+    # eating the full 10-minute budget. Revert to 10 once the hang is found.
+    timeout-minutes: 3
 
     steps:
       - name: Checkout
