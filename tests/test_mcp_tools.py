@@ -163,6 +163,45 @@ def _assert_states_positively(desc, token_re, label):
         )
 
 
+_UNSET_MARKER = re.compile(
+    r"\b(unset|not set|omit\w*|not (?:given|provided|passed|specified)|"
+    r"falls?\s+back|default(?:s|ed)?\s+to|without an? explicit|left (?:unset|blank))\b",
+    re.I,
+)
+
+
+def _assert_states_unset_behaviour(desc, fallback_re, label):
+    """At least one clause both (a) marks itself as being about the omitted/unset
+    case (`_UNSET_MARKER`: "unset", "not set", "omitted", "falls back", "defaults
+    to", ...) and (b) names the concrete fallback (`fallback_re`, e.g. "parent
+    session"), with no negation outside that marker's own matched text -- kills a
+    description that never says what happens when the parameter is left out at
+    all, and kills the token-soup case where the fallback word is merely listed as
+    if it were an accepted value (e.g. permission_mode's `inherit` sitting in a
+    bare "default, acceptEdits, plan, bypassPermissions, inherit" list): that
+    clause carries no unset marker, so it does not qualify as a genuine
+    inheritance-claim clause on its own. Negation is checked only outside the
+    unset-marker's own match span, so idiomatic phrasing like "if not set,
+    inherits ..." -- whose own "not" is what marks the unset case, not a negation
+    of the fallback claim -- is not mistaken for a false/opposite claim."""
+    clauses = re.split(r"(?<=[.!?;])\s+", desc)
+    matches = []
+    for clause in clauses:
+        marker = _UNSET_MARKER.search(clause)
+        if marker and re.search(fallback_re, clause, re.I):
+            matches.append((clause, marker))
+    assert matches, (
+        f"{label}: no clause states both an unset/omitted marker and a "
+        f"{fallback_re!r} fallback together in: {desc!r}"
+    )
+    for clause, marker in matches:
+        remainder = clause[: marker.start()] + clause[marker.end():]
+        assert not _NEGATORS.search(remainder), (
+            f"{label}: unset-behaviour clause reads as a negative/opposite claim "
+            f"outside its own unset marker: {clause!r}"
+        )
+
+
 def _assert_states_negatively(desc, token_re, label):
     """At least one sentence mentions `token_re` AND carries a negation word --
     proves the description actually states the negative fact (e.g. "the parent's
@@ -210,6 +249,11 @@ def test_start_tools_document_accepted_values(server_params):
     _assert_states_positively(
         effort_desc, r"--effort", "harness_start_agent effort description"
     )
+    _assert_states_unset_behaviour(
+        effort_desc,
+        r"parent session",
+        "harness_start_agent effort description (unset falls back to parent session)",
+    )
 
     model_desc = agent_props["model"].get("description") or ""
     for token in ("opus", "sonnet", "haiku", "claude-"):
@@ -217,14 +261,26 @@ def test_start_tools_document_accepted_values(server_params):
     _assert_states_positively(
         model_desc, r"\bmodel\b", "harness_start_agent model description"
     )
+    _assert_states_unset_behaviour(
+        model_desc,
+        r"parent session",
+        "harness_start_agent model description (unset falls back to parent session)",
+    )
 
     perm_desc = agent_props["permission_mode"].get("description") or ""
     for token in ("default", "acceptEdits", "plan", "bypassPermissions", "inherit"):
         assert token in perm_desc, (
             f"harness_start_agent permission_mode description missing {token!r}"
         )
-    _assert_states_positively(
-        perm_desc, r"inherit", "harness_start_agent permission_mode description"
+    # Tightened per round-3 test-critic F1: bare presence of "inherit" would also
+    # be satisfied by a description that merely lists it as a fifth accepted
+    # value (e.g. "default, acceptEdits, plan, bypassPermissions, inherit"), which
+    # is not an inheritance claim at all. Require the word to sit in a genuine
+    # unset-value-fallback clause instead.
+    _assert_states_unset_behaviour(
+        perm_desc,
+        r"parent session|inherit",
+        "harness_start_agent permission_mode description (unset falls back to parent session)",
     )
 
     start_prompt = by_name["harness_start_prompt"]
@@ -905,30 +961,55 @@ def test_effort_source_none_for_start_prompt_even_with_session_effort(
 
 def test_send_message_reports_origin_runs_effort_source(server_params, argv_log):
     """R2 additional edge-case coverage: harness_send_message on a finished run
-    reports the origin run's effort_source. The origin run is started and finished
-    in one server process; harness_send_message is then issued from a second,
-    fresh process (not the one that started/finished the origin run), so an
-    effort_source kept only in the first process's memory could not answer it."""
+    reports the origin run's effort_source -- for two origins with *different*
+    recorded sources, so the resume path is forced to actually look up and echo
+    each origin's real recorded source rather than a constant: a
+    harness_start_prompt(effort="low") origin (source "argument") and a
+    harness_start_agent("demo") origin with no explicit effort, inherited from
+    session_context's effort: high (source "parent_session"). An implementation
+    that always answers "argument" for resumed runs -- for unrelated or wrong
+    reasons -- passes the first pair here but fails the second. Both origins are
+    started and finished in one server process; harness_send_message is then
+    issued from a second, fresh process (not the one that started/finished the
+    origin runs), so an effort_source kept only in the first process's memory
+    could not answer it."""
 
     async def start_scenario(session):
-        is_error, text, origin = await _call(
+        is_error, text, argument_origin = await _call(
             session, "harness_start_prompt", prompt="Say OK.", model="sonnet", effort="low"
         )
         assert not is_error, text
-        await _poll_until_terminal(session, origin["run_id"])
-        return origin
+        await _poll_until_terminal(session, argument_origin["run_id"])
 
-    origin = _run(start_scenario, server_params)
+        is_error2, text2, session_origin = await _call(
+            session, "harness_start_agent", agent="demo"
+        )
+        assert not is_error2, text2
+        await _poll_until_terminal(session, session_origin["run_id"])
+
+        return argument_origin, session_origin
+
+    argument_origin, session_origin = _run(start_scenario, server_params)
+    assert argument_origin["effort_source"] == "argument"
+    assert session_origin["effort_source"] == "parent_session"
+    assert session_origin["effort"] == "high"  # inherited from session_context
 
     async def send_scenario(session):
-        sent = await _call(session, "harness_send_message", run_id=origin["run_id"], prompt="hi")
-        assert not sent[0], sent[1]
-        return sent[2]
+        sent_argument = await _call(
+            session, "harness_send_message", run_id=argument_origin["run_id"], prompt="hi"
+        )
+        assert not sent_argument[0], sent_argument[1]
+        sent_session = await _call(
+            session, "harness_send_message", run_id=session_origin["run_id"], prompt="hi"
+        )
+        assert not sent_session[0], sent_session[1]
+        return sent_argument[2], sent_session[2]
 
-    follow_up = _run(send_scenario, server_params)
-    assert origin["effort_source"] == "argument"
-    assert follow_up["effort_source"] == "argument"
-    assert follow_up["effort"] == "low"
+    follow_up_argument, follow_up_session = _run(send_scenario, server_params)
+    assert follow_up_argument["effort_source"] == "argument"
+    assert follow_up_argument["effort"] == "low"
+    assert follow_up_session["effort_source"] == "parent_session"
+    assert follow_up_session["effort"] == "high"
 
 
 def test_list_agents_and_start_prompt_work_without_context(server_params_no_context, project_dir):
