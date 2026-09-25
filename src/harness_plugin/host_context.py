@@ -175,8 +175,12 @@ def parent_mcp_servers(cwd: str) -> dict[str, Any]:
     Merge order: user (`<CLAUDE_CONFIG_DIR>/.claude.json` top level) -> project
     (`<cwd>/.mcp.json`, approved via `enableAllProjectMcpServers` or
     `enabledMcpjsonServers`, minus `disabledMcpjsonServers`) -> local
-    (`projects[cwd].mcpServers`), then `projects[cwd].disabledMcpServers` is
-    dropped from the merged result. Enabled plugins' own manifests are added last,
+    (`projects[cwd].mcpServers`, forwarded only when
+    `projects[cwd].hasTrustDialogAccepted` is true -- the same trust gate the real
+    CLI applies before auto-connecting local-scope servers; an untrusted entry's
+    local servers are dropped, not forwarded), then
+    `projects[cwd].disabledMcpServers` is dropped from the merged result. Enabled
+    plugins' own manifests are added last,
     keyed `plugin_<plugin>_<server>` with `${CLAUDE_PLUGIN_ROOT}`/`${PLUGIN_ROOT}`/
     `${CLAUDE_PLUGIN_DATA}`/`${CLAUDE_PROJECT_DIR}` expanded and that plugin's own
     `CLAUDE_PLUGIN_ROOT`/`CLAUDE_PLUGIN_DATA` injected into `env` -- except the
@@ -196,6 +200,12 @@ def parent_mcp_servers(cwd: str) -> dict[str, Any]:
     project_entry = _project_entry(projects, cwd_str)
     local_servers = project_entry.get("mcpServers")
     local_servers = local_servers if isinstance(local_servers, dict) else {}
+    if not project_entry.get("hasTrustDialogAccepted"):
+        # The real CLI only auto-connects local-scope servers once the project's
+        # trust dialog has been accepted (normally implied by an interactive
+        # `claude mcp add -s local`); an untrusted project entry's local
+        # mcpServers are silently skipped, never forwarded to the child.
+        local_servers = {}
     disabled_merged = set(project_entry.get("disabledMcpServers") or [])
     disabled_jsonc = set(project_entry.get("disabledMcpjsonServers") or [])
 

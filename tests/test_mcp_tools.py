@@ -1744,7 +1744,9 @@ def _git_marker(project_dir: Path) -> None:
 
 def _provision_parent_servers(config_dir: Path, project: Path) -> set[str]:
     """Plants a full parent MCP-server set across every source `parent_mcp_servers`
-    is meant to read: user + local scope in `config_dir/.claude.json`, an approved
+    is meant to read: user + local scope (with `hasTrustDialogAccepted: True`, the
+    trust gate the real CLI requires before forwarding local-scope servers) in
+    `config_dir/.claude.json`, an approved
     project server (`project/.mcp.json`, approved via `project/.claude/settings.json`'s
     `enableAllProjectMcpServers`), a `fixture` plugin's own `fsrv` server (keyed
     `plugin_fixture_fsrv`) and the `agent-harness` plugin's own `harness` server
@@ -1757,7 +1759,9 @@ def _provision_parent_servers(config_dir: Path, project: Path) -> set[str]:
     data = json.loads(claude_json.read_text()) if claude_json.exists() else {}
     data.setdefault("mcpServers", {})["user-srv"] = {"command": "user-cmd"}
     projects = data.setdefault("projects", {})
-    projects.setdefault(str(project), {})["mcpServers"] = {"local-srv": {"command": "local-cmd"}}
+    project_entry = projects.setdefault(str(project), {})
+    project_entry["mcpServers"] = {"local-srv": {"command": "local-cmd"}}
+    project_entry["hasTrustDialogAccepted"] = True
     claude_json.parent.mkdir(parents=True, exist_ok=True)
     claude_json.write_text(json.dumps(data), encoding="utf-8")
 

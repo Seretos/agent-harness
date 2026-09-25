@@ -145,6 +145,7 @@ def test_parent_mcp_servers_rebuilds_all_sources(monkeypatch, tmp_path):
                 str(project_dir): {
                     "mcpServers": {"local-srv": {"command": "local-cmd"}},
                     "disabledMcpServers": ["user-disabled-srv"],
+                    "hasTrustDialogAccepted": True,
                 }
             },
         },
@@ -250,6 +251,74 @@ def test_parent_mcp_servers_excludes_unapproved_project_server(monkeypatch, tmp_
 
     result = hc.parent_mcp_servers(str(project_dir))
     assert result == {"approved": {"command": "ok-cmd"}}
+
+
+def test_parent_mcp_servers_local_scope_requires_trust_dialog_accepted(monkeypatch, tmp_path):
+    """R2 (round-2 reviewer fix): local-scope mcpServers (projects[cwd].mcpServers)
+    are only forwarded when that project entry's hasTrustDialogAccepted is true --
+    the same gate the real CLI applies before auto-connecting local-scope servers.
+    A hand-crafted entry with no trust flag (or an explicit false) is silently
+    skipped, matching test_live_claude.py's R1 live-verified comment that an
+    untrusted lslow entry never appeared anywhere in the transcript even though
+    the file entry itself was correct. An entry with hasTrustDialogAccepted: True
+    still forwards its local servers."""
+    config_dir = tmp_path / "claude-config"
+    untrusted_dir = tmp_path / "untrusted-project"
+    trusted_dir = tmp_path / "trusted-project"
+    untrusted_dir.mkdir(parents=True)
+    trusted_dir.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+
+    _write_json(
+        config_dir / ".claude.json",
+        {
+            "projects": {
+                str(untrusted_dir): {
+                    "mcpServers": {"local-srv": {"command": "local-cmd"}},
+                    # no hasTrustDialogAccepted key at all
+                },
+                str(trusted_dir): {
+                    "mcpServers": {"local-srv": {"command": "local-cmd"}},
+                    "hasTrustDialogAccepted": True,
+                },
+            },
+        },
+    )
+
+    from harness_plugin import host_context as hc
+
+    untrusted_result = hc.parent_mcp_servers(str(untrusted_dir))
+    assert "local-srv" not in untrusted_result
+    assert untrusted_result == {}
+
+    trusted_result = hc.parent_mcp_servers(str(trusted_dir))
+    assert trusted_result == {"local-srv": {"command": "local-cmd"}}
+
+
+def test_parent_mcp_servers_local_scope_explicit_false_is_untrusted(monkeypatch, tmp_path):
+    """Same gate, but with hasTrustDialogAccepted explicitly False rather than
+    absent -- both must be treated as untrusted."""
+    config_dir = tmp_path / "claude-config"
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+
+    _write_json(
+        config_dir / ".claude.json",
+        {
+            "projects": {
+                str(project_dir): {
+                    "mcpServers": {"local-srv": {"command": "local-cmd"}},
+                    "hasTrustDialogAccepted": False,
+                },
+            },
+        },
+    )
+
+    from harness_plugin import host_context as hc
+
+    result = hc.parent_mcp_servers(str(project_dir))
+    assert result == {}
 
 
 def test_parent_mcp_servers_skips_corrupt_claude_json(monkeypatch, tmp_path):
