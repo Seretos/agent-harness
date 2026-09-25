@@ -77,3 +77,221 @@ def test_probe_warns_when_session_id_missing(hc):
     warning = hc.probe_warning({})
     assert warning and "CLAUDE_CODE_SESSION_ID" in warning
     assert hc.probe_warning({"CLAUDE_CODE_SESSION_ID": "abc"}) is None
+
+
+# --- parent_mcp_servers / build_host_context (#38 R2) ------------------------------
+
+
+def _write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _write_plugin_manifest(install_dir, name, mcp_servers):
+    _write_json(
+        install_dir / ".claude-plugin" / "plugin.json",
+        {"name": name, "mcpServers": mcp_servers},
+    )
+
+
+def _register_plugin(config_dir, key, install_dir, *, enabled=True):
+    """Read-merge-write into config_dir's installed_plugins.json/settings.json --
+    same read-merge-write pattern test_mcp_tools.py's
+    test_list_agents_uses_session_cwd_and_respects_disabled_plugins already uses to
+    add a second plugin registration on top of one a fixture already wrote."""
+    installed_path = config_dir / "plugins" / "installed_plugins.json"
+    installed = (
+        json.loads(installed_path.read_text()) if installed_path.exists() else {"version": 2, "plugins": {}}
+    )
+    installed.setdefault("plugins", {})[key] = [{"scope": "user", "installPath": str(install_dir)}]
+    _write_json(installed_path, installed)
+    settings_path = config_dir / "settings.json"
+    settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+    settings.setdefault("enabledPlugins", {})[key] = enabled
+    _write_json(settings_path, settings)
+
+
+def test_parent_mcp_servers_rebuilds_all_sources(monkeypatch, tmp_path):
+    """R2: parent_mcp_servers(cwd) rebuilds the parent's active MCP-server set from
+    <CLAUDE_CONFIG_DIR>/.claude.json (user scope at the top level, local scope at
+    projects[cwd].mcpServers, projects[cwd].disabledMcpServers dropped from the
+    merged result), the project's own .mcp.json (approved via the project's
+    .claude/settings.json enableAllProjectMcpServers), and enabled plugins' own
+    manifests -- keyed plugin_<plugin>_<server>, with placeholders expanded and
+    each server's env carrying that plugin's own CLAUDE_PLUGIN_ROOT/
+    CLAUDE_PLUGIN_DATA -- except the agent-harness plugin's own `harness` server,
+    which keeps the literal bare key `harness` (AC1). A disabled plugin (off@mk)
+    contributes nothing.
+
+    Expected RED reason: AttributeError -- parent_mcp_servers does not exist yet
+    on host_context.
+    """
+    config_dir = tmp_path / "claude-config"
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True)
+    fixture_dir = tmp_path / "plugins" / "fixture"
+    harness_dir = tmp_path / "plugins" / "agent-harness"
+    off_dir = tmp_path / "plugins" / "off"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+
+    _write_json(
+        config_dir / ".claude.json",
+        {
+            "mcpServers": {
+                "user-srv": {"command": "user-cmd"},
+                "user-disabled-srv": {"command": "disabled-cmd"},
+            },
+            "projects": {
+                str(project_dir): {
+                    "mcpServers": {"local-srv": {"command": "local-cmd"}},
+                    "disabledMcpServers": ["user-disabled-srv"],
+                }
+            },
+        },
+    )
+    _write_json(
+        project_dir / ".mcp.json",
+        {"mcpServers": {"proj-srv": {"command": "proj-cmd"}}},
+    )
+    _write_json(
+        project_dir / ".claude" / "settings.json",
+        {"enableAllProjectMcpServers": True},
+    )
+    _write_plugin_manifest(
+        fixture_dir,
+        "fixture",
+        {
+            "fsrv": {
+                "command": "${CLAUDE_PLUGIN_ROOT}/bin/fsrv",
+                "env": {
+                    "ROOT_MARKER": "${CLAUDE_PLUGIN_ROOT}",
+                    "DATA_MARKER": "${CLAUDE_PLUGIN_DATA}",
+                },
+            }
+        },
+    )
+    _write_plugin_manifest(
+        harness_dir, "agent-harness", {"harness": {"command": "${CLAUDE_PLUGIN_ROOT}/bin/harness", "args": []}}
+    )
+    _write_plugin_manifest(off_dir, "off", {"offsrv": {"command": "off-cmd"}})
+    _register_plugin(config_dir, "fixture@mk", fixture_dir)
+    _register_plugin(config_dir, "agent-harness@mk", harness_dir)
+    _register_plugin(config_dir, "off@mk", off_dir, enabled=False)
+
+    from harness_plugin import host_context as hc
+
+    result = hc.parent_mcp_servers(str(project_dir))  # AttributeError today.
+
+    assert "user-disabled-srv" not in result
+    assert "offsrv" not in result
+    assert not any(name.startswith("plugin_off_") for name in result)
+
+    data_fixture = result["plugin_fixture_fsrv"]["env"]["CLAUDE_PLUGIN_DATA"]
+    data_harness = result["harness"]["env"]["CLAUDE_PLUGIN_DATA"]
+    assert data_fixture and isinstance(data_fixture, str)
+    assert data_harness and isinstance(data_harness, str)
+    assert data_fixture != data_harness, "each plugin must get its own CLAUDE_PLUGIN_DATA"
+
+    expected = {
+        "user-srv": {"command": "user-cmd"},
+        "proj-srv": {"command": "proj-cmd"},
+        "local-srv": {"command": "local-cmd"},
+        "plugin_fixture_fsrv": {
+            "command": f"{fixture_dir}/bin/fsrv",
+            "env": {
+                "ROOT_MARKER": str(fixture_dir),
+                "DATA_MARKER": data_fixture,
+                "CLAUDE_PLUGIN_ROOT": str(fixture_dir),
+                "CLAUDE_PLUGIN_DATA": data_fixture,
+            },
+        },
+        "harness": {
+            "command": f"{harness_dir}/bin/harness",
+            "args": [],
+            "env": {
+                "CLAUDE_PLUGIN_ROOT": str(harness_dir),
+                "CLAUDE_PLUGIN_DATA": data_harness,
+            },
+        },
+    }
+    assert result == expected
+
+    ctx = hc.build_host_context({}, str(project_dir))
+    assert ctx.dispatch_mcp_server_name == "harness"
+    assert ctx.mcp_servers == expected
+    assert ctx.available_mcp_servers == expected
+
+
+def test_parent_mcp_servers_excludes_unapproved_project_server(monkeypatch, tmp_path):
+    """R2 behaviour: a project .mcp.json server not named in
+    projects[cwd].enabledMcpjsonServers is not approved and stays absent -- the
+    opt-in-by-name form of approval, distinct from the blanket
+    enableAllProjectMcpServers the main scenario above uses."""
+    config_dir = tmp_path / "claude-config"
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+
+    _write_json(
+        config_dir / ".claude.json",
+        {"projects": {str(project_dir): {"enabledMcpjsonServers": ["approved"]}}},
+    )
+    _write_json(
+        project_dir / ".mcp.json",
+        {
+            "mcpServers": {
+                "approved": {"command": "ok-cmd"},
+                "unapproved": {"command": "no-cmd"},
+            }
+        },
+    )
+
+    from harness_plugin import host_context as hc
+
+    result = hc.parent_mcp_servers(str(project_dir))
+    assert result == {"approved": {"command": "ok-cmd"}}
+
+
+def test_parent_mcp_servers_skips_corrupt_claude_json(monkeypatch, tmp_path):
+    """R2 additional edge-case B: a corrupt (unparseable) .claude.json is skipped,
+    not raised. The user scope (top-level mcpServers) and local scope
+    (projects[cwd].mcpServers) both live in that one file, so a corrupt copy drops
+    both; a plugin's own manifest lives elsewhere and is unaffected. The project's
+    own .mcp.json approval also lives in the same corrupt file, so with no
+    readable approval data nothing from it is approved either -- a project server
+    is opt-in, never approved by default."""
+    config_dir = tmp_path / "claude-config"
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True)
+    fixture_dir = tmp_path / "plugins" / "fixture"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / ".claude.json").write_text("{not json", encoding="utf-8")
+    _write_json(project_dir / ".mcp.json", {"mcpServers": {"proj-srv": {"command": "proj-cmd"}}})
+    _write_json(project_dir / ".claude" / "settings.json", {"enableAllProjectMcpServers": True})
+    _write_plugin_manifest(fixture_dir, "fixture", {"fsrv": {"command": "fsrv-cmd"}})
+    _register_plugin(config_dir, "fixture@mk", fixture_dir)
+
+    from harness_plugin import host_context as hc
+
+    result = hc.parent_mcp_servers(str(project_dir))
+    assert result == {"plugin_fixture_fsrv": {"command": "fsrv-cmd"}}
+
+
+def test_parent_mcp_servers_with_no_files_is_empty_and_dispatch_is_none(monkeypatch, tmp_path):
+    """R2 additional edge-case C: no files anywhere gives {} and build_host_context
+    leaves dispatch_mcp_server_name None (no `harness` key present)."""
+    config_dir = tmp_path / "claude-config"
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+
+    from harness_plugin import host_context as hc
+
+    result = hc.parent_mcp_servers(str(project_dir))
+    assert result == {}
+
+    ctx = hc.build_host_context({}, str(project_dir))
+    assert ctx.dispatch_mcp_server_name is None
+    assert ctx.mcp_servers == {}

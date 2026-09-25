@@ -5,10 +5,15 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
 
 import anyio
 import pytest
-from test_mcp_tools import _call, _poll_until_terminal, _run
+from conftest import SESSION_ID
+from test_mcp_tools import _call, _poll_until_terminal, _run, _session
 
 pytestmark = pytest.mark.live
 
@@ -110,6 +115,323 @@ def test_live_start_plugin_agent_colon_qualified(live_server_params, tmp_path):
     assert announced_tools == {"Read"}, (
         "the tools allowlist must be enforced -- the default tool set must not leak"
     )
+
+
+# --- parent MCP server set announced at first turn, live (#38 R1) -----------------
+
+SLOW_STUB = Path(__file__).parent / "fixtures" / "slow_mcp_stub.py"
+_STUB_DELAY_S = "5"
+
+
+def _run_live(scenario, params, timeout_s=280.0):
+    """Like test_mcp_tools._run, but with a caller-chosen deadline instead of that
+    helper's hardcoded 60s -- a dispatch across five MCP servers (four 5-second-slow
+    stubs plus a real nested harness_plugin process) genuinely takes longer than a
+    single quick "Say OK." dispatch does."""
+
+    async def main():
+        with anyio.fail_after(timeout_s):
+            async with _session(params) as session:
+                return await scenario(session)
+
+    return anyio.run(main)
+
+
+def _real_credentials_path() -> Path:
+    base = os.environ.get("CLAUDE_CONFIG_DIR")
+    root = Path(base) if base else (Path.home() / ".claude")
+    return root / ".credentials.json"
+
+
+def _write_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _stub_server(name: str, log_path: Path) -> dict:
+    return {"command": sys.executable, "args": [str(SLOW_STUB), name, _STUB_DELAY_S, str(log_path)]}
+
+
+@pytest.mark.timeout(600)  # exceeds the repo's global 60s default: up to 3 real-dispatch attempts
+def test_live_parent_mcp_servers_at_first_turn():
+    """R1 -- the ticket's binding symptom criterion, live: a plugin agent started
+    via harness_start_agent with no .seretos/harness.yml entry sees every MCP
+    server the parent session has configured (project .mcp.json, user/local,
+    enabled plugins' servers, harness included) in its first-turn deferred-tool
+    announcement, none still pending, and can call a tool on each.
+
+    Every one of the five sources (user, local, project, the harness-live-fixture
+    plugin's own `pslow`, and the agent-harness plugin's own `harness`) is a
+    5-second-slow-to-connect stub (or, for `harness`, the real -- and not
+    especially fast to import -- harness_plugin server), with
+    CLAUDE_CODE_MCP_STARTUP_WAIT_MS/MCP_TIMEOUT left unset, so there is no
+    first-turn deadline unless an explicit --mcp-config gives one (plan P2).
+
+    Expected RED reason on current code: the plugin passes no explicit
+    --mcp-config for a no-entry launch, so the CLI applies no first-turn wait for
+    any of the five stubs; `_first_turn_announcement`'s `pending` set is non-empty
+    at the model's first turn (uslow/lslow/jslow/the pslow-plugin form and/or the
+    harness dispatch server still connecting) -- falsifying nothing about P2, just
+    reproducing the ticket's own symptom on unfixed code.
+    """
+    if shutil.which("claude") is None:
+        pytest.skip("the real `claude` CLI is not on PATH")
+    real_credentials = _real_credentials_path()
+    if not real_credentials.is_file():
+        pytest.skip(f"no real credentials at {real_credentials}; cannot run a live child")
+
+    for var in ("CLAUDE_CODE_MCP_STARTUP_WAIT_MS", "MCP_TIMEOUT"):
+        if var in os.environ:
+            pytest.skip(f"{var} is set in this environment; R1 requires it unset")
+
+    # A short root, not pytest's own tmp_path fixture: tmp_path nests several
+    # directory levels deep (pytest-of-<user>/pytest-<N>/<test-name>-<N>/...), and
+    # the real claude CLI encodes a run's *entire absolute cwd path* into the
+    # transcript directory name under <CLAUDE_CONFIG_DIR>/projects/ (colons and
+    # separators replaced with "-"). Combined with pytest's own nesting, the
+    # resulting transcript path reliably exceeds Windows' 260-char MAX_PATH,
+    # which silently breaks exact-name glob() matching (observed directly: glob()
+    # matched the same file fine via a wildcard suffix or via rglob(), but never
+    # via its own full literal name, once the full path crossed ~260 chars) --
+    # not a timing race, a path-length ceiling. A short root keeps every path in
+    # this test comfortably under that ceiling.
+    tmp_path = Path(tempfile.mkdtemp(prefix="ah38-"))
+    config_dir = tmp_path / "claude-config"
+    project_dir = tmp_path / "live-project"
+    project_dir.mkdir(parents=True)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+
+    config_dir.mkdir(parents=True)
+    shutil.copy(real_credentials, config_dir / ".credentials.json")
+
+    # -- user (uslow) + local (lslow), both in <CLAUDE_CONFIG_DIR>/.claude.json ----
+    # hasTrustDialogAccepted: local-scope mcpServers is normally added via an
+    # interactive `claude mcp add -s local`, which implies the project is already
+    # trusted; a hand-crafted entry with no trust flag was verified live to be
+    # silently skipped (lslow never appeared anywhere in the transcript, unlike
+    # every other source, even though the file entry itself was correct).
+    _write_json(
+        config_dir / ".claude.json",
+        {
+            "mcpServers": {"uslow": _stub_server("uslow", logs / "uslow.log")},
+            "projects": {
+                str(project_dir): {
+                    "mcpServers": {"lslow": _stub_server("lslow", logs / "lslow.log")},
+                    "hasTrustDialogAccepted": True,
+                }
+            },
+        },
+    )
+
+    # -- project (jslow), approved via settings.local.json ------------------------
+    _write_json(
+        project_dir / ".mcp.json", {"mcpServers": {"jslow": _stub_server("jslow", logs / "jslow.log")}}
+    )
+    _write_json(
+        project_dir / ".claude" / "settings.local.json", {"enableAllProjectMcpServers": True}
+    )
+
+    # -- plugin harness-live-fixture@lt: agents/slowcheck.md + mcpServers.pslow ---
+    # -- plugin agent-harness@lt: harness = this repo's own harness_plugin server -
+    # Both are installed through the real `claude plugin marketplace add` / `install`
+    # commands rather than hand-crafted installed_plugins.json/known_marketplaces.json:
+    # the real CLI validates plugin registration against a marketplace entry (its
+    # `source` recorded in settings.json's extraKnownMarketplaces and
+    # plugins/known_marketplaces.json) before it will load a plugin's own manifest --
+    # a hand-crafted installed_plugins.json entry with no matching marketplace was
+    # verified live to be silently ignored (never mentioned anywhere in the child's
+    # transcript). The CLI's own commands populate that state correctly; their exact
+    # shape is undocumented and not worth reverse-engineering by hand.
+    marketplace_dir = tmp_path / "marketplace"
+    fixture_dir = marketplace_dir / "harness-live-fixture"
+    (fixture_dir / "agents").mkdir(parents=True)
+    (fixture_dir / "agents" / "slowcheck.md").write_text(
+        "---\n"
+        "name: slowcheck\n"
+        "description: R1 live fixture agent -- calls every stub_nonce tool plus harness_list_agents\n"
+        "model: haiku\n"
+        "---\n"
+        "You have access to several MCP tools whose names end in `stub_nonce`, and a tool named "
+        "`harness_list_agents`. Call every single tool visible to you whose name matches either of "
+        "those two patterns, one at a time, each exactly once. Once every call has returned a "
+        "result, reply with the single word DONE and nothing else.\n",
+        encoding="utf-8",
+    )
+    _write_json(
+        fixture_dir / ".claude-plugin" / "plugin.json",
+        {
+            "name": "harness-live-fixture",
+            "mcpServers": {"pslow": _stub_server("pslow", logs / "pslow.log")},
+        },
+    )
+    harness_dir = marketplace_dir / "agent-harness"
+    _write_json(
+        harness_dir / ".claude-plugin" / "plugin.json",
+        {
+            "name": "agent-harness",
+            "mcpServers": {"harness": {"command": sys.executable, "args": ["-m", "harness_plugin"]}},
+        },
+    )
+    _write_json(
+        marketplace_dir / ".claude-plugin" / "marketplace.json",
+        {
+            "name": "lt",
+            "owner": {"name": "R1 live fixture"},
+            "metadata": {"version": "0.0.0", "description": "R1 live fixture marketplace"},
+            "plugins": [
+                {
+                    "name": "harness-live-fixture",
+                    "description": "R1 live fixture plugin",
+                    "source": "./harness-live-fixture",
+                    "category": "mcp",
+                    "version": "0.0.0",
+                },
+                {
+                    "name": "agent-harness",
+                    "description": "R1 live fixture: this repo's own harness server",
+                    "source": "./agent-harness",
+                    "category": "mcp",
+                    "version": "0.0.0",
+                },
+            ],
+        },
+    )
+    setup_env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_dir)}
+    added = subprocess.run(
+        ["claude", "plugin", "marketplace", "add", str(marketplace_dir)],
+        capture_output=True, text=True, timeout=60, env=setup_env,
+    )
+    assert added.returncode == 0, f"marketplace add failed: {added.stdout} {added.stderr}"
+    for plugin_name in ("harness-live-fixture", "agent-harness"):
+        installed = subprocess.run(
+            ["claude", "plugin", "install", f"{plugin_name}@lt", "-y"],
+            capture_output=True, text=True, timeout=60, env=setup_env,
+        )
+        assert installed.returncode == 0, f"install {plugin_name} failed: {installed.stdout} {installed.stderr}"
+
+    env = {**os.environ}
+    for var in ("HARNESS_CLAUDE_ARGV",):
+        env.pop(var, None)
+    env["HARNESS_ARTIFACTS_DIR"] = str(tmp_path / "artifacts")
+    env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    env["CLAUDE_PLUGIN_DATA"] = str(tmp_path / "plugin-data")
+    env["CLAUDE_CODE_SESSION_ID"] = SESSION_ID
+    from conftest import plant_session_file
+
+    plant_session_file(
+        tmp_path / "plugin-data",
+        SESSION_ID,
+        cwd=str(project_dir),
+        project_dir=str(project_dir),
+        permission_mode="bypassPermissions",
+        model="haiku",
+    )
+    from mcp import StdioServerParameters
+
+    params = StdioServerParameters(command=sys.executable, args=["-m", "harness_plugin"], env=env)
+
+    async def scenario(session):
+        is_error, text, started = await _call(
+            session, "harness_start_agent", agent="harness-live-fixture:slowcheck", cwd=str(project_dir)
+        )
+        assert not is_error, text
+        final = await _poll_until_terminal(session, started["run_id"], budget=240.0)
+        return final
+
+    final = _run_live(scenario, params)
+    assert final["state"] == "COMPLETED", final
+
+    # lib_python_harness's own transcript_path resolution (harness.py
+    # Harness._resolve_transcript_path, called once from _finalize) was observed to
+    # come back None here even though the file exists -- not a timing race, but
+    # Windows' 260-char MAX_PATH: exact-literal-name glob() matching silently
+    # breaks once the full path crosses that ceiling (verified directly: the very
+    # same file matched fine via a wildcard-suffixed pattern or via rglob(), never
+    # via glob() with the session_id spelled out in full), and this run's transcript
+    # path is long (a deeply-nested tmp root's cwd gets encoded whole into the
+    # projects/ subdirectory name). Re-resolved here defensively with a wildcard
+    # pattern instead of the exact literal name, from this test's own process.
+    transcript_path = final["transcript_path"]
+    if transcript_path is None:
+        session_id = final["session_id"]
+        matches = []
+        for _ in range(10):
+            matches = [
+                p for p in (config_dir / "projects").glob("*/*.jsonl") if session_id in p.name
+            ]
+            if matches:
+                break
+            time.sleep(1.0)
+        assert matches, (
+            f"no transcript file for session {session_id!r} under {config_dir} "
+            "even after the run fully completed and a 10s wait"
+        )
+        transcript_path = str(matches[0])
+
+    found_delta, servers, pending, needs_auth, failed = _first_turn_announcement(transcript_path)
+    assert found_delta, (
+        "no deferred_tools_delta attachment entry was found before this run's first "
+        f"assistant turn (transcript: {transcript_path})"
+    )
+    expected_min = {"plugin_harness-live-fixture_pslow", "harness", "jslow", "uslow", "lslow"}
+    report = (
+        f"servers={sorted(servers)} pending={sorted(pending)} "
+        f"needs_auth(diagnostic only)={sorted(needs_auth)} failed(diagnostic only)={sorted(failed)}"
+    )
+    assert expected_min <= servers, f"not every configured server was announced: {report}"
+    assert not pending, f"server(s) still pending at the model's first turn: {report}"
+
+    # dedup edge-case coverage: once fixed, never both the rebuilt key *and* the
+    # native plugin-qualified form for the same server (mcp__plugin_<p>_<s>__* is
+    # how a native plugin MCP tool's name already normalises -- verified live:
+    # pre-fix, harness's own native announced form is exactly
+    # "plugin_agent-harness_harness", not "harness").
+    assert not ({"harness", "plugin_agent-harness_harness"} <= servers), (
+        f"both the bare dispatch key and the native plugin-qualified harness form "
+        f"must not both appear: {report}"
+    )
+    assert not ({"plugin_harness-live-fixture_pslow", "pslow"} <= servers), (
+        f"both the prefixed and bare forms of pslow must not both appear: {report}"
+    )
+
+    logged_nonces = set()
+    for log in logs.glob("*.log"):
+        logged_nonces |= {line.strip() for line in log.read_text(encoding="utf-8").splitlines() if line.strip()}
+    assert logged_nonces, f"no stub logged a call at all: {report}"
+    transcript_text = Path(transcript_path).read_text(encoding="utf-8")
+    tool_result_lines = [
+        line for line in transcript_text.splitlines() if '"type": "tool_result"' in line or '"type":"tool_result"' in line
+    ]
+    tool_result_blob = "\n".join(tool_result_lines) or transcript_text
+    missing_nonces = {nonce for nonce in logged_nonces if nonce not in tool_result_blob}
+    assert not missing_nonces, f"logged nonce(s) never showed up in a tool_result: {missing_nonces}"
+
+    # The child's own call to the harness dispatch server: a tool_use naming
+    # *_harness_list_agents in an assistant turn, followed by a non-error tool_result
+    # for that same tool_use_id -- proves the run itself called it, not just this
+    # test harness's own separate connection to a different harness_plugin process.
+    tool_use_id = None
+    tool_result_ok = None
+    for line in transcript_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        entry = json.loads(line)
+        message = (entry.get("message") or {})
+        for block in message.get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            if tool_use_id is None and block.get("type") == "tool_use" and (
+                block.get("name") or ""
+            ).endswith("harness_list_agents"):
+                tool_use_id = block.get("id")
+            elif tool_use_id and block.get("type") == "tool_result" and block.get("tool_use_id") == tool_use_id:
+                tool_result_ok = not block.get("is_error", False)
+    assert tool_use_id is not None, f"harness_list_agents was never called by the run: {report}"
+    assert tool_result_ok, f"harness_list_agents call returned an error result: {report}"
+
+    shutil.rmtree(tmp_path, ignore_errors=True)
 
 
 # Hardcoded, independent of _ACCEPTED_VALUES: the minimum this repo already commits
