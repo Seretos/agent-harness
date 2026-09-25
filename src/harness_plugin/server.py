@@ -16,6 +16,7 @@ from lib_python_harness import (
     RunSpec,
     RunState,
     discover,
+    load_harness_config,
     resolve,
 )
 from mcp.server.fastmcp import FastMCP
@@ -190,9 +191,9 @@ def harness_start_agent(
     from: `agent_definition`, `argument`, `parent_session` or `none`. An optional short
     `label` names the run and shows up in harness_list_runs. An optional `prompt` is the
     run's task (the user message); the agent definition's body stays the system prompt.
-    Without `prompt` the run gets a default task. The MCP-server/deferred-tool list a run is
-    announced at start-up can be incomplete; use ToolSearch before concluding a tool is
-    unavailable."""
+    Without `prompt` the run gets a default task. The run's MCP-server set is the parent
+    session's own (project, user/local, enabled plugins, harness), rebuilt explicitly and
+    passed to the launch rather than left for the child to discover on its own."""
     if prompt is not None and not prompt.strip():
         raise HarnessError("prompt must not be empty")
     data, source = load_session_context()
@@ -221,7 +222,18 @@ def harness_start_agent(
     if definition is None:
         known = ", ".join(sorted(definitions)) or "(none)"
         raise ToolError(f"unknown agent {agent!r}; known agents: {known}")
-    spec = resolve(definition, ctx, task=prompt)
+    config = load_harness_config(used)
+    spec = resolve(definition, ctx, config=config, task=prompt)
+    if spec.strict_mcp is None:
+        # No config-driven mcpServers set for this agent (apply_config never ran,
+        # or ran but this agent had no entry/defaults to apply): the parent's
+        # rebuilt set still has to reach the child explicitly (#38), since a
+        # non-strict launch with no --mcp-config gets no first-turn connect
+        # deadline (plan P2). A config-driven spec (strict_mcp is not None) is
+        # left exactly as apply_config produced it -- merging here would undo
+        # its removals and re-add servers it deliberately dropped.
+        merged = {**(ctx.mcp_servers or {}), **(spec.mcp_servers or {})}
+        spec.mcp_servers = merged or None
     if model:
         spec.model = model
     if spec.model is None:

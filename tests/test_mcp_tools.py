@@ -1727,3 +1727,269 @@ def test_inspect_run_while_running_and_error_paths(server_params):
     assert "HarnessError" in cleaned[1]
 
     assert alive[0] is False, alive[1]
+
+
+# --- parent MCP server set at launch (#38 R3-R5) -----------------------------------
+
+
+def _git_marker(project_dir: Path) -> None:
+    """`.seretos/harness.yml` discovery (`lib_python_config.walk_project_boundaries`)
+    only looks inside a git repo -- it walks outward from cwd via `.git` boundaries,
+    never bare directory levels, and `project_dir` (a plain tmp dir) has none. Every
+    R4/R5 test that plants a `.seretos/harness.yml` and expects it to be found needs
+    this marker first; R3's tests never plant one, so `load_harness_config` finds
+    nothing anywhere and returns `None` -- no marker needed there."""
+    (project_dir / ".git").mkdir(parents=True, exist_ok=True)
+
+
+def _provision_parent_servers(config_dir: Path, project: Path) -> set[str]:
+    """Plants a full parent MCP-server set across every source `parent_mcp_servers`
+    is meant to read: user + local scope (with `hasTrustDialogAccepted: True`, the
+    trust gate the real CLI requires before forwarding local-scope servers) in
+    `config_dir/.claude.json`, an approved
+    project server (`project/.mcp.json`, approved via `project/.claude/settings.json`'s
+    `enableAllProjectMcpServers`), a `fixture` plugin's own `fsrv` server (keyed
+    `plugin_fixture_fsrv`) and the `agent-harness` plugin's own `harness` server
+    (keyed bare `harness`). Must be called together with the `plugin_agent_install`
+    fixture, which is what registers the `agent-harness@mk` plugin key this reuses
+    (read-merge-write onto its installed_plugins.json/settings.json, same pattern
+    `test_list_agents_uses_session_cwd_and_respects_disabled_plugins` already uses).
+    Returns the expected server-name set."""
+    claude_json = config_dir / ".claude.json"
+    data = json.loads(claude_json.read_text()) if claude_json.exists() else {}
+    data.setdefault("mcpServers", {})["user-srv"] = {"command": "user-cmd"}
+    projects = data.setdefault("projects", {})
+    project_entry = projects.setdefault(str(project), {})
+    project_entry["mcpServers"] = {"local-srv": {"command": "local-cmd"}}
+    project_entry["hasTrustDialogAccepted"] = True
+    claude_json.parent.mkdir(parents=True, exist_ok=True)
+    claude_json.write_text(json.dumps(data), encoding="utf-8")
+
+    (project / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"proj-srv": {"command": "proj-cmd"}}}), encoding="utf-8"
+    )
+    settings_dir = project / ".claude"
+    settings_dir.mkdir(parents=True, exist_ok=True)
+    (settings_dir / "settings.json").write_text(
+        json.dumps({"enableAllProjectMcpServers": True}), encoding="utf-8"
+    )
+
+    plugins_root = config_dir.parent / "plugins"
+    fixture_dir = plugins_root / "fixture"
+    (fixture_dir / ".claude-plugin").mkdir(parents=True, exist_ok=True)
+    (fixture_dir / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "fixture", "mcpServers": {"fsrv": {"command": "fsrv-cmd"}}}),
+        encoding="utf-8",
+    )
+    harness_dir = plugins_root / "agent-harness"
+    (harness_dir / ".claude-plugin").mkdir(parents=True, exist_ok=True)
+    (harness_dir / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "agent-harness", "mcpServers": {"harness": {"command": "harness-cmd"}}}),
+        encoding="utf-8",
+    )
+
+    installed_path = config_dir / "plugins" / "installed_plugins.json"
+    installed = json.loads(installed_path.read_text())
+    installed["plugins"]["fixture@mk"] = [{"scope": "user", "installPath": str(fixture_dir)}]
+    installed_path.write_text(json.dumps(installed), encoding="utf-8")
+    settings_path = config_dir / "settings.json"
+    settings = json.loads(settings_path.read_text())
+    settings["enabledPlugins"]["fixture@mk"] = True
+    settings_path.write_text(json.dumps(settings), encoding="utf-8")
+
+    return {"user-srv", "local-srv", "proj-srv", "plugin_fixture_fsrv", "harness"}
+
+
+@pytest.mark.parametrize("carrier", ["agent-harness:probe", "demo", "mcp-agent"])
+def test_start_agent_launch_carries_parent_server_set(
+    server_params, plugin_agent_install, project_dir, mcp_agent_project, argv_log, carrier
+):
+    """R3: whichever cwd/agent is dispatched, the child's --mcp-config carries the
+    full parent server set `_provision_parent_servers` planted -- for a plugin-scope
+    agent (agent-harness:probe, whose own frontmatter carries no mcpServers), a
+    project-scope agent with no mcpServers of its own (demo), and one that does
+    declare its own mcpServers (mcp-agent's demo-server, which must survive
+    alongside the parent set, not be replaced by it). No --strict-mcp-config (no
+    harness.yml is involved here).
+
+    Expected RED reason: today host_context never populates ctx.mcp_servers, so
+    resolve() never puts anything into spec.mcp_servers for `agent-harness:probe`
+    or `demo` (no --mcp-config is emitted at all -- _flag raises), and `mcp-agent`'s
+    own frontmatter mcpServers (demo-server) is the *only* thing in --mcp-config,
+    not the parent set plus demo-server.
+    """
+    cwd = mcp_agent_project if carrier == "mcp-agent" else project_dir
+    config_dir = Path(server_params.env["CLAUDE_CONFIG_DIR"])
+    expected = _provision_parent_servers(config_dir, cwd)
+    if carrier == "mcp-agent":
+        expected = expected | {"demo-server"}
+
+    started, final = _start_and_finish(server_params, agent=carrier, cwd=str(cwd), model="sonnet")
+    assert final["state"] == "COMPLETED", final
+    (record,) = _argv_records(argv_log)
+    assert "--strict-mcp-config" not in record["argv"]
+    mcp_config = json.loads(_flag(record["argv"], "--mcp-config"))
+    assert set(mcp_config["mcpServers"].keys()) == expected
+
+    async def scenario(session):
+        return await _call(session, "harness_inspect_run", run_id=started["run_id"])
+
+    is_error, text, inspected = _run(scenario, server_params)
+    assert not is_error, text
+    assert set(inspected["requested"]["mcp_servers"]) == expected
+
+
+def test_start_agent_send_message_replay_keeps_same_mcp_config(
+    server_params, plugin_agent_install, project_dir, argv_log
+):
+    """R3 additional edge-case coverage: a harness_send_message follow-up replays
+    the origin run's own argv (start_resume), so its --mcp-config must carry the
+    same parent server set as the origin, not a freshly recomputed (and possibly
+    different) one."""
+    config_dir = Path(server_params.env["CLAUDE_CONFIG_DIR"])
+    expected = _provision_parent_servers(config_dir, project_dir)
+
+    async def scenario(session):
+        is_error, text, started = await _call(
+            session, "harness_start_agent", agent="demo", cwd=str(project_dir), model="sonnet"
+        )
+        assert not is_error, text
+        origin = await _poll_until_terminal(session, started["run_id"])
+        sent = await _call(session, "harness_send_message", run_id=origin["run_id"], prompt="hi")
+        assert not sent[0], sent[1]
+        follow_up = await _poll_until_terminal(session, sent[2]["run_id"])
+        return follow_up
+
+    _run(scenario, server_params)
+    records = _argv_records(argv_log)
+    assert len(records) == 2
+    for record in records:
+        mcp_config = json.loads(_flag(record["argv"], "--mcp-config"))
+        assert set(mcp_config["mcpServers"].keys()) == expected
+
+
+def test_start_agent_applies_harness_yml(
+    server_params, plugin_agent_install, project_dir, argv_log
+):
+    """R4: a `.seretos/harness.yml` `agents: demo:` entry's `mcpServers.remove` and
+    `canSpawn: true` take effect once the config is actually loaded and passed to
+    resolve() -- both named servers are gone from --mcp-config, --strict-mcp-config
+    is present (config-driven runs are always strict), and the rest of the parent
+    set (including the granted `harness` dispatch server) remains.
+
+    Expected RED reason: harness_start_agent never loads .seretos/harness.yml today
+    (no `config=` is passed to resolve()), so apply_config never runs at all: no
+    server is removed and --strict-mcp-config never appears.
+    """
+    config_dir = Path(server_params.env["CLAUDE_CONFIG_DIR"])
+    provisioned = _provision_parent_servers(config_dir, project_dir)
+    _git_marker(project_dir)
+    (project_dir / ".seretos").mkdir(parents=True, exist_ok=True)
+    (project_dir / ".seretos" / "harness.yml").write_text(
+        "agents:\n"
+        "  demo:\n"
+        "    canSpawn: true\n"
+        "    mcpServers:\n"
+        "      remove: [user-srv, plugin_fixture_fsrv]\n",
+        encoding="utf-8",
+    )
+
+    started, final = _start_and_finish(server_params, agent="demo", cwd=str(project_dir), model="sonnet")
+    assert final["state"] == "COMPLETED", final
+    (record,) = _argv_records(argv_log)
+    assert "--strict-mcp-config" in record["argv"]
+    mcp_config = json.loads(_flag(record["argv"], "--mcp-config"))
+    assert set(mcp_config["mcpServers"].keys()) == (provisioned - {"user-srv", "plugin_fixture_fsrv"})
+
+
+def test_start_agent_harness_yml_remove_uses_the_prefixed_catalogue_key(
+    server_params, plugin_agent_install, project_dir, argv_log
+):
+    """R4 additional edge-case coverage: `remove:` must name the catalogue key
+    (`plugin_fixture_fsrv`), not the plugin manifest's own bare server name
+    (`fsrv`) -- the latter matches nothing and leaves the server present. This
+    documents which form `.seretos/harness.yml` actually needs. The `demo` entry
+    here sets no `canSpawn`, so per R5's own default (v0.0.6: canSpawn false) the
+    granted dispatch server `harness` must be absent too -- this is a
+    config-driven (strict) launch like any other `agents:` entry, not a bypass of
+    the canSpawn default. (Fixed per round-1 test-critic tautology::F2: the
+    previous version of this test wrongly asserted `harness` present, which only
+    an implementation that ignores harness.yml -- or overrides canSpawn -- could
+    satisfy.)"""
+    config_dir = Path(server_params.env["CLAUDE_CONFIG_DIR"])
+    provisioned = _provision_parent_servers(config_dir, project_dir)
+    _git_marker(project_dir)
+    (project_dir / ".seretos").mkdir(parents=True, exist_ok=True)
+    (project_dir / ".seretos" / "harness.yml").write_text(
+        "agents:\n  demo:\n    mcpServers:\n      remove: [fsrv]\n", encoding="utf-8"
+    )
+
+    started, final = _start_and_finish(server_params, agent="demo", cwd=str(project_dir), model="sonnet")
+    assert final["state"] == "COMPLETED", final
+    (record,) = _argv_records(argv_log)
+    assert "--strict-mcp-config" in record["argv"]
+    mcp_config = json.loads(_flag(record["argv"], "--mcp-config"))
+    assert "plugin_fixture_fsrv" in mcp_config["mcpServers"]
+    assert set(mcp_config["mcpServers"].keys()) == (provisioned - {"harness"})
+
+
+def test_start_agent_invalid_harness_yml_raises_config_error(
+    server_params, project_dir, argv_log
+):
+    """R4 additional edge-case coverage: an invalid .seretos/harness.yml (unknown
+    key) is surfaced as a ToolError naming ConfigError, and no child is started."""
+    _git_marker(project_dir)
+    (project_dir / ".seretos").mkdir(parents=True, exist_ok=True)
+    (project_dir / ".seretos" / "harness.yml").write_text(
+        "agents:\n  demo:\n    notARealKey: true\n", encoding="utf-8"
+    )
+
+    async def scenario(session):
+        return await _call(
+            session, "harness_start_agent", agent="demo", cwd=str(project_dir), model="sonnet"
+        )
+
+    is_error, text, _ = _run(scenario, server_params)
+    assert is_error, "an invalid harness.yml must refuse the launch"
+    assert "ConfigError" in text
+    assert not argv_log.exists()
+
+
+def test_start_agent_can_spawn_follows_lib_default(
+    server_params, plugin_agent_install, project_dir, argv_log
+):
+    """R5 (AC4): once .seretos/harness.yml is loaded, whether the `harness`
+    dispatch server is granted follows only the lib's own canSpawn default (false)
+    and the file's explicit override (true) -- no override of that default lives in
+    this repo. Both dispatches go strict (config-driven), proving the config really
+    loaded for both; only the dispatch server's presence differs.
+
+    Expected RED reason: harness.yml is never loaded today, so neither dispatch is
+    strict at all (--strict-mcp-config absent from both).
+    """
+    config_dir = Path(server_params.env["CLAUDE_CONFIG_DIR"])
+    _provision_parent_servers(config_dir, project_dir)
+    _git_marker(project_dir)
+    (project_dir / ".seretos").mkdir(parents=True, exist_ok=True)
+    (project_dir / ".seretos" / "harness.yml").write_text(
+        "agents:\n"
+        "  demo: {}\n"
+        "  effort-agent:\n"
+        "    canSpawn: true\n",
+        encoding="utf-8",
+    )
+
+    started_a, final_a = _start_and_finish(server_params, agent="demo", cwd=str(project_dir), model="sonnet")
+    assert final_a["state"] == "COMPLETED", final_a
+    started_b, final_b = _start_and_finish(
+        server_params, agent="effort-agent", cwd=str(project_dir), model="sonnet"
+    )
+    assert final_b["state"] == "COMPLETED", final_b
+
+    record_a, record_b = _argv_records(argv_log)
+    assert "--strict-mcp-config" in record_a["argv"], "demo has no canSpawn -- must still go strict"
+    assert "--strict-mcp-config" in record_b["argv"]
+    mcp_config_a = json.loads(_flag(record_a["argv"], "--mcp-config"))
+    mcp_config_b = json.loads(_flag(record_b["argv"], "--mcp-config"))
+    assert "harness" not in mcp_config_a["mcpServers"], "canSpawn defaults false (lib v0.0.6)"
+    assert "harness" in mcp_config_b["mcpServers"], "canSpawn: true must grant the dispatch server"
