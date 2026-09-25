@@ -1732,6 +1732,16 @@ def test_inspect_run_while_running_and_error_paths(server_params):
 # --- parent MCP server set at launch (#38 R3-R5) -----------------------------------
 
 
+def _git_marker(project_dir: Path) -> None:
+    """`.seretos/harness.yml` discovery (`lib_python_config.walk_project_boundaries`)
+    only looks inside a git repo -- it walks outward from cwd via `.git` boundaries,
+    never bare directory levels, and `project_dir` (a plain tmp dir) has none. Every
+    R4/R5 test that plants a `.seretos/harness.yml` and expects it to be found needs
+    this marker first; R3's tests never plant one, so `load_harness_config` finds
+    nothing anywhere and returns `None` -- no marker needed there."""
+    (project_dir / ".git").mkdir(parents=True, exist_ok=True)
+
+
 def _provision_parent_servers(config_dir: Path, project: Path) -> set[str]:
     """Plants a full parent MCP-server set across every source `parent_mcp_servers`
     is meant to read: user + local scope in `config_dir/.claude.json`, an approved
@@ -1869,6 +1879,7 @@ def test_start_agent_applies_harness_yml(
     """
     config_dir = Path(server_params.env["CLAUDE_CONFIG_DIR"])
     provisioned = _provision_parent_servers(config_dir, project_dir)
+    _git_marker(project_dir)
     (project_dir / ".seretos").mkdir(parents=True, exist_ok=True)
     (project_dir / ".seretos" / "harness.yml").write_text(
         "agents:\n"
@@ -1893,9 +1904,17 @@ def test_start_agent_harness_yml_remove_uses_the_prefixed_catalogue_key(
     """R4 additional edge-case coverage: `remove:` must name the catalogue key
     (`plugin_fixture_fsrv`), not the plugin manifest's own bare server name
     (`fsrv`) -- the latter matches nothing and leaves the server present. This
-    documents which form `.seretos/harness.yml` actually needs."""
+    documents which form `.seretos/harness.yml` actually needs. The `demo` entry
+    here sets no `canSpawn`, so per R5's own default (v0.0.6: canSpawn false) the
+    granted dispatch server `harness` must be absent too -- this is a
+    config-driven (strict) launch like any other `agents:` entry, not a bypass of
+    the canSpawn default. (Fixed per round-1 test-critic tautology::F2: the
+    previous version of this test wrongly asserted `harness` present, which only
+    an implementation that ignores harness.yml -- or overrides canSpawn -- could
+    satisfy.)"""
     config_dir = Path(server_params.env["CLAUDE_CONFIG_DIR"])
     provisioned = _provision_parent_servers(config_dir, project_dir)
+    _git_marker(project_dir)
     (project_dir / ".seretos").mkdir(parents=True, exist_ok=True)
     (project_dir / ".seretos" / "harness.yml").write_text(
         "agents:\n  demo:\n    mcpServers:\n      remove: [fsrv]\n", encoding="utf-8"
@@ -1904,9 +1923,10 @@ def test_start_agent_harness_yml_remove_uses_the_prefixed_catalogue_key(
     started, final = _start_and_finish(server_params, agent="demo", cwd=str(project_dir), model="sonnet")
     assert final["state"] == "COMPLETED", final
     (record,) = _argv_records(argv_log)
+    assert "--strict-mcp-config" in record["argv"]
     mcp_config = json.loads(_flag(record["argv"], "--mcp-config"))
     assert "plugin_fixture_fsrv" in mcp_config["mcpServers"]
-    assert set(mcp_config["mcpServers"].keys()) == provisioned
+    assert set(mcp_config["mcpServers"].keys()) == (provisioned - {"harness"})
 
 
 def test_start_agent_invalid_harness_yml_raises_config_error(
@@ -1914,6 +1934,7 @@ def test_start_agent_invalid_harness_yml_raises_config_error(
 ):
     """R4 additional edge-case coverage: an invalid .seretos/harness.yml (unknown
     key) is surfaced as a ToolError naming ConfigError, and no child is started."""
+    _git_marker(project_dir)
     (project_dir / ".seretos").mkdir(parents=True, exist_ok=True)
     (project_dir / ".seretos" / "harness.yml").write_text(
         "agents:\n  demo:\n    notARealKey: true\n", encoding="utf-8"
@@ -1944,6 +1965,7 @@ def test_start_agent_can_spawn_follows_lib_default(
     """
     config_dir = Path(server_params.env["CLAUDE_CONFIG_DIR"])
     _provision_parent_servers(config_dir, project_dir)
+    _git_marker(project_dir)
     (project_dir / ".seretos").mkdir(parents=True, exist_ok=True)
     (project_dir / ".seretos" / "harness.yml").write_text(
         "agents:\n"

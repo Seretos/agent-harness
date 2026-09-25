@@ -395,10 +395,26 @@ def test_live_parent_mcp_servers_at_first_turn():
         f"both the prefixed and bare forms of pslow must not both appear: {report}"
     )
 
+    # Strengthened per round-1 test-critic tautology::F3: the plan's headline is
+    # "each callable", not just "at least one call happened" -- require every one
+    # of the four stub logs (uslow/lslow/jslow/pslow) to have logged its own
+    # call, not merely a non-empty union across whichever stubs happened to log.
     logged_nonces = set()
-    for log in logs.glob("*.log"):
-        logged_nonces |= {line.strip() for line in log.read_text(encoding="utf-8").splitlines() if line.strip()}
-    assert logged_nonces, f"no stub logged a call at all: {report}"
+    empty_stub_logs = set()
+    for stub_name in ("uslow", "lslow", "jslow", "pslow"):
+        log = logs / f"{stub_name}.log"
+        lines = (
+            {line.strip() for line in log.read_text(encoding="utf-8").splitlines() if line.strip()}
+            if log.exists()
+            else set()
+        )
+        if not lines:
+            empty_stub_logs.add(stub_name)
+        logged_nonces |= lines
+    assert not empty_stub_logs, (
+        f"stub(s) never logged a call -- their stub_nonce tool was never actually "
+        f"invoked, even though the server was announced: {sorted(empty_stub_logs)}; {report}"
+    )
     transcript_text = Path(transcript_path).read_text(encoding="utf-8")
     tool_result_lines = [
         line for line in transcript_text.splitlines() if '"type": "tool_result"' in line or '"type":"tool_result"' in line

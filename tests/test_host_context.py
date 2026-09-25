@@ -256,10 +256,16 @@ def test_parent_mcp_servers_skips_corrupt_claude_json(monkeypatch, tmp_path):
     """R2 additional edge-case B: a corrupt (unparseable) .claude.json is skipped,
     not raised. The user scope (top-level mcpServers) and local scope
     (projects[cwd].mcpServers) both live in that one file, so a corrupt copy drops
-    both; a plugin's own manifest lives elsewhere and is unaffected. The project's
-    own .mcp.json approval also lives in the same corrupt file, so with no
-    readable approval data nothing from it is approved either -- a project server
-    is opt-in, never approved by default."""
+    both -- but the project's own approval (`enableAllProjectMcpServers`) lives in
+    a *separate* file, `<cwd>/.claude/settings.json`, so it is unaffected by the
+    corruption and the project's own .mcp.json server is still approved and
+    present; a plugin's own manifest lives elsewhere too and is likewise
+    unaffected. Per the plan (R2 edge B): "A with a corrupt `.claude.json` gives
+    A's dict minus user/local" -- i.e. proj-srv and the plugin server survive,
+    only user-srv/local-srv (which only exist inside the corrupt file) are gone.
+    (Fixed per round-1 test-critic tautology::F1: the previous version of this
+    test wrongly asserted proj-srv absent, contradicting the plan's own stated
+    case-B behaviour and the env-injection requirement.)"""
     config_dir = tmp_path / "claude-config"
     project_dir = tmp_path / "project"
     project_dir.mkdir(parents=True)
@@ -276,7 +282,17 @@ def test_parent_mcp_servers_skips_corrupt_claude_json(monkeypatch, tmp_path):
     from harness_plugin import host_context as hc
 
     result = hc.parent_mcp_servers(str(project_dir))
-    assert result == {"plugin_fixture_fsrv": {"command": "fsrv-cmd"}}
+    data_fixture = result["plugin_fixture_fsrv"]["env"]["CLAUDE_PLUGIN_DATA"]
+    assert result == {
+        "proj-srv": {"command": "proj-cmd"},
+        "plugin_fixture_fsrv": {
+            "command": "fsrv-cmd",
+            "env": {
+                "CLAUDE_PLUGIN_ROOT": str(fixture_dir),
+                "CLAUDE_PLUGIN_DATA": data_fixture,
+            },
+        },
+    }
 
 
 def test_parent_mcp_servers_with_no_files_is_empty_and_dispatch_is_none(monkeypatch, tmp_path):
