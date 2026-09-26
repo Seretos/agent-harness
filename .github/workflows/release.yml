@@ -13,7 +13,8 @@ name: release
 #               single staging tree, builds the release zip with correct
 #               Unix mode bits (Python zipfile), force-pushes the orphan
 #               `release` branch, creates the GitHub Release, and dispatches
-#               to the marketplace.
+#               to both marketplaces (curated modular-software-factory via
+#               PR, staging modular-software-factory-staging directly).
 #
 # plugin.json uses an extensionless `command: ${CLAUDE_PLUGIN_ROOT}/bin/harness`
 # — the host OS auto-resolves to `harness.exe` on Windows and
@@ -332,9 +333,13 @@ jobs:
             "${{ steps.rel.outputs.asset }}"
 
       # Tags created via GITHUB_TOKEN don't fire downstream push:tags workflows
-      # (Actions blocks this to prevent recursive loops). Call the marketplace
-      # directly with a separate PAT.
-      - name: Dispatch to agent-marketplace
+      # (Actions blocks this to prevent recursive loops). Call both
+      # marketplaces directly with a separate PAT. The curated marketplace
+      # (modular-software-factory) opens a review PR; the staging marketplace
+      # (modular-software-factory-staging) commits straight to main. Same
+      # client_payload shape for both — the shared receiver-side action lives
+      # once in modular-software-factory-dev's .github/actions/update-registry.
+      - name: Dispatch to modular-software-factory (curated, PR review)
         shell: bash
         env:
           GH_PAT:  ${{ secrets.MARKETPLACE_DISPATCH_TOKEN }}
@@ -346,7 +351,36 @@ jobs:
           curl -fsSL -X POST \
             -H "Authorization: Bearer $GH_PAT" \
             -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/Seretos/agent-marketplace/dispatches \
+            https://api.github.com/repos/seretos-agents/modular-software-factory/dispatches \
+            -d @- <<EOF
+          {
+            "event_type": "plugin-release",
+            "client_payload": {
+              "name":        "${NAME}",
+              "description": "${DESC}",
+              "repo":        "${{ github.repository }}",
+              "category":    "mcp",
+              "version":     "${VERSION}",
+              "ref":         "${TAG}",
+              "icon":        "https://raw.githubusercontent.com/${{ github.repository }}/${TAG}/assets/icon.png",
+              "description_url": "https://raw.githubusercontent.com/${{ github.repository }}/${TAG}/description.md"
+            }
+          }
+          EOF
+
+      - name: Dispatch to modular-software-factory-staging (direct)
+        shell: bash
+        env:
+          GH_PAT:  ${{ secrets.MARKETPLACE_DISPATCH_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          NAME:    ${{ needs.stamp.outputs.plugin_name }}
+          TAG:     ${{ needs.stamp.outputs.tag }}
+        run: |
+          DESC=$(jq -r '.description' stamped/.claude-plugin/plugin.json)
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/seretos-agents/modular-software-factory-staging/dispatches \
             -d @- <<EOF
           {
             "event_type": "plugin-release",
