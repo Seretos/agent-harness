@@ -647,7 +647,7 @@ def test_list_runs_lists_runs_same_server_and_after_restart(server_params, proje
         if sys.platform == "win32":
             # Ending the stdio session kills the server's process tree, including the
             # detached fake-claude child, so after a restart the orphan may be reconciled
-            # to FAILED (re-verified on lib-python-harness v0.0.6: still fails 5/5 without
+            # to FAILED (re-verified on lib-python-harness v0.0.8: still fails 5/5 without
             # this allowance; same limitation as the skipped wait-run cancel test).
             assert rows[sleeper_id]["state"] in {"RUNNING", "FAILED"}
         else:
@@ -1909,7 +1909,7 @@ def test_start_agent_harness_yml_remove_uses_the_prefixed_catalogue_key(
     (`plugin_fixture_fsrv`), not the plugin manifest's own bare server name
     (`fsrv`) -- the latter matches nothing and leaves the server present. This
     documents which form `.seretos/harness.yml` actually needs. The `demo` entry
-    here sets no `canSpawn`, so per R5's own default (v0.0.6: canSpawn false) the
+    here sets no `canSpawn`, so per R5's own default (v0.0.8: canSpawn false) the
     granted dispatch server `harness` must be absent too -- this is a
     config-driven (strict) launch like any other `agents:` entry, not a bypass of
     the canSpawn default. (Fixed per round-1 test-critic tautology::F2: the
@@ -1991,5 +1991,5 @@ def test_start_agent_can_spawn_follows_lib_default(
     assert "--strict-mcp-config" in record_b["argv"]
     mcp_config_a = json.loads(_flag(record_a["argv"], "--mcp-config"))
     mcp_config_b = json.loads(_flag(record_b["argv"], "--mcp-config"))
-    assert "harness" not in mcp_config_a["mcpServers"], "canSpawn defaults false (lib v0.0.6)"
+    assert "harness" not in mcp_config_a["mcpServers"], "canSpawn defaults false (lib v0.0.8)"
     assert "harness" in mcp_config_b["mcpServers"], "canSpawn: true must grant the dispatch server"
