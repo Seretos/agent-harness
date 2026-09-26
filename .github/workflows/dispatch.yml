@@ -1,10 +1,10 @@
 name: dispatch-to-marketplace
 
 # Manual recovery tool. The normal release flow (release.yml) dispatches to
-# the marketplace itself. Use this only when:
-#   - The marketplace dispatch step in release.yml failed and you want to
+# both marketplaces itself. Use this only when:
+#   - A marketplace dispatch step in release.yml failed and you want to
 #     retry without re-running the whole build.
-#   - You need to re-publish an existing release to the marketplace (e.g.
+#   - You need to re-publish an existing release to the marketplace(s) (e.g.
 #     after the marketplace.json schema changed).
 on:
   workflow_dispatch:
@@ -53,7 +53,7 @@ jobs:
           echo "description=${DESC}" >> "$GITHUB_OUTPUT"
           echo "name=${NAME}"        >> "$GITHUB_OUTPUT"
 
-      - name: Dispatch to agent-marketplace
+      - name: Dispatch to modular-software-factory (curated, PR review)
         env:
           GH_PAT:  ${{ secrets.MARKETPLACE_DISPATCH_TOKEN }}
           NAME:    ${{ steps.meta.outputs.name }}
@@ -65,7 +65,36 @@ jobs:
           curl -fsSL -X POST \
             -H "Authorization: Bearer $GH_PAT" \
             -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/Seretos/agent-marketplace/dispatches \
+            https://api.github.com/repos/seretos-agents/modular-software-factory/dispatches \
+            -d @- <<EOF
+          {
+            "event_type": "plugin-release",
+            "client_payload": {
+              "name":        "${NAME}",
+              "description": "${DESC}",
+              "repo":        "${{ github.repository }}",
+              "category":    "mcp",
+              "version":     "${VERSION}",
+              "ref":         "${TAG}",
+              "icon":        "https://raw.githubusercontent.com/${{ github.repository }}/${TAG}/assets/icon.png",
+              "description_url": "https://raw.githubusercontent.com/${{ github.repository }}/${TAG}/description.md"
+            }
+          }
+          EOF
+
+      - name: Dispatch to modular-software-factory-staging (direct)
+        env:
+          GH_PAT:  ${{ secrets.MARKETPLACE_DISPATCH_TOKEN }}
+          NAME:    ${{ steps.meta.outputs.name }}
+          DESC:    ${{ steps.meta.outputs.description }}
+          VERSION: ${{ steps.tag.outputs.version }}
+          TAG:     ${{ steps.tag.outputs.tag }}
+        shell: bash
+        run: |
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/seretos-agents/modular-software-factory-staging/dispatches \
             -d @- <<EOF
           {
             "event_type": "plugin-release",

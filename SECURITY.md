@@ -44,7 +44,7 @@ Common additions seen in sibling plugins:
   document: where they're read from, what they're sent to, whether they
   appear in tool responses or logs, and what response fields expose
   presence-of-token vs. token-value.
-  Pattern: see [Token handling](https://github.com/Seretos/agent-project-issues/blob/main/SECURITY.md#token-handling)
+  Pattern: see [Token handling](https://github.com/seretos-agents/agent-project-issues/blob/main/SECURITY.md#token-handling)
   in agent-project-issues.
 
   ## Permission gating
